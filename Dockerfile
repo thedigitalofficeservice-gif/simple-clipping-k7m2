@@ -30,6 +30,13 @@ COPY static /app/static
 RUN python3 /opt/beyondgtaclips/scripts/setup_env.py --system-python
 
 RUN mkdir -p /data && chmod 777 /data
+
+# 4. yt-dlp config: YouTube shows a sign-in/bot wall to the default web
+#    player client from datacenter IPs. The Android/iOS player clients do
+#    not hit that wall for public videos. Downloader setting only — the
+#    engine itself is untouched.
+RUN mkdir -p /root/.config/yt-dlp && printf '%s\n' '--extractor-args youtube:player_client=android,ios,web' > /root/.config/yt-dlp/config
+
 EXPOSE 7860
 # No login, no secrets needed: the app is open to anyone with the link.
 CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]
