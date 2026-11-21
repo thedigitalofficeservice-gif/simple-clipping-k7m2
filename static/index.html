@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<title>Simple Clipping</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header>
+  <div class="logo">✂️ Simple Clipping</div>
+</header>
+
+<main>
+  <section class="card" id="form-card">
+    <h1>Make clips</h1>
+    <p class="sub">Paste a YouTube, Twitch or Kick link. The app finds the best moments and cuts up to 6 vertical clips with captions.</p>
+    <input id="link" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off">
+    <p class="hint">Public videos only. A longer video gives better clips. It takes a few minutes.</p>
+    <button id="start-btn" class="btn primary big">▶ Start Clipping</button>
+    <p id="form-error" class="error hidden"></p>
+  </section>
+
+  <section class="card hidden" id="progress-card">
+    <h2 id="progress-title">Clipping…</h2>
+    <div class="progress"><div id="progress-bar"></div></div>
+    <p id="progress-stage" class="stage">Starting…</p>
+    <pre id="progress-log"></pre>
+    <button id="cancel-btn" class="btn danger">Cancel</button>
+  </section>
+
+  <section id="results"></section>
+
+  <section class="card" id="history-card">
+    <h2>Your clips</h2>
+    <p class="sub">Finished clips stay here for 7 days. Watch them again or download them to your phone.</p>
+    <div id="history"><p class="hint">Loading…</p></div>
+  </section>
+</main>
+
+<footer>Clips are made on this private server and deleted after 7 days. Only clip creators who allow it, and always credit the streamer.</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
