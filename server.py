@@ -218,13 +218,17 @@ def _run_job(job):
         # Caption + render settings live in the engine's settings.json
         # (per-job, jobs run one at a time). Low-memory settings for the
         # free 1GB Railway server: Whisper "tiny" for captions (instead of
-        # "base") and 720p output (instead of 1080p), so the render step
-        # fits in 1 GB RAM. These are the engine's own documented
-        # settings.json knobs — the engine itself is untouched.
+        # "base"), 720p source slices, a faster x264 preset and no
+        # punch-in zooms, so the render step fits in 1 GB RAM. The render
+        # canvas itself is 1080x1920 by the engine's design. These are the
+        # engine's own documented settings.json knobs — the engine itself
+        # is untouched.
         settings_path = ENGINE_HOME / "settings.json"
         settings_path.write_text(json.dumps({"clean_captions": p["captions"],
                                              "caption_model": "tiny",
-                                             "video_height": 720}), encoding="utf-8")
+                                             "video_height": 720,
+                                             "x264_preset": "veryfast",
+                                             "punch_ins": False}), encoding="utf-8")
         if p.get("source_type") == "upload":
             # Serve the uploaded file on localhost and hand the engine an
             # http(s) URL, because yt-dlp (the engine's downloader) fetches by URL.
