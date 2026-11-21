@@ -12,11 +12,13 @@ $("start-btn").addEventListener("click", async () => {
   const errEl = $("form-error");
   errEl.classList.add("hidden");
   const link = $("link").value.trim();
-  if (!link) { errEl.textContent = "Paste a video link first."; errEl.classList.remove("hidden"); return; }
+  const file = $("file").files[0];
+  if (!link && !file) { errEl.textContent = "Paste a video link or choose a video file first."; errEl.classList.remove("hidden"); return; }
   $("start-btn").disabled = true;
   try {
     const fd = new FormData();
-    fd.append("link", link);
+    if (link) fd.append("link", link);
+    if (file) fd.append("upload", file);
     const { id } = await api("/api/jobs", { method: "POST", body: fd });
     currentJob = id;
     $("progress-card").classList.remove("hidden");
@@ -105,7 +107,7 @@ async function loadHistory() {
       const sec = document.createElement("div");
       sec.className = "history-job";
       const when = new Date(j.created_at).toLocaleString();
-      sec.innerHTML = `<h3>${esc(j.params.url)}</h3><p class="hint">${when} — ${j.clips.length} clips</p>`;
+      sec.innerHTML = `<h3>${esc(j.params.source_name || j.params.url || "Uploaded video")}</h3><p class="hint">${when} — ${j.clips.length} clips</p>`;
       j.clips.forEach((c, i) => sec.appendChild(clipCard(c, i, j.id)));
       host.appendChild(sec);
     });

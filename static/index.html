@@ -18,9 +18,11 @@
 <main>
   <section class="card" id="form-card">
     <h1>Make clips</h1>
-    <p class="sub">Paste a YouTube, Twitch or Kick link. The app finds the best moments and cuts up to 6 vertical clips with captions.</p>
-    <input id="link" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off">
-    <p class="hint">Public videos only. A longer video gives better clips. It takes a few minutes.</p>
+    <p class="sub">Paste a video link, or upload a video file. The app finds the best moments and cuts up to 6 vertical clips with captions.</p>
+    <input id="link" type="url" placeholder="https://www.youtube.com/watch?v=... or Twitch / Kick link" autocomplete="off">
+    <p class="hint">Or upload a video file instead (up to 500 MB, at least 1 minute long).</p>
+    <input id="file" type="file" accept="video/*,.mkv,.mov,.avi">
+    <p class="hint">Note: YouTube currently blocks downloads from this server, so a YouTube link may fail — uploading the video file always works. A longer video gives better clips. It takes a few minutes.</p>
     <button id="start-btn" class="btn primary big">▶ Start Clipping</button>
     <p id="form-error" class="error hidden"></p>
   </section>
