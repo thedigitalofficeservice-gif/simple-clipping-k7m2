@@ -229,6 +229,7 @@ def _run_job(job):
                                              "video_height": 720,
                                              "width": 720,
                                              "height": 1280,
+                                             "loudness": None,
                                              "x264_preset": "veryfast",
                                              "punch_ins": False}), encoding="utf-8")
         if p.get("source_type") == "upload":
