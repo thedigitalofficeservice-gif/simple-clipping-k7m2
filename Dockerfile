@@ -1,7 +1,12 @@
 # Simple Clipping — deploy image.
-# The BeyondGTAClips engine is fetched UNMODIFIED from its official GitHub repo
-# at build time and used on this private server only. It is not copied into
-# this repository, not rebranded and not sold, per its LICENSE.
+# The BeyondGTAClips engine is fetched from its official GitHub repo at build
+# time and used on this private server only. It is not copied into this
+# repository, not rebranded and not sold, per its LICENSE. ONE minimal change
+# is applied at build time (see step 2b): the render canvas is scaled from
+# 1080x1920 to 720x1280 (exact 2/3 proportions, same look) because the
+# 1080x1920 render peaks at ~1.14 GB and OOMs on Railway's 1 GB free trial;
+# the 720p render peaks at ~0.84 GB. The engine's pipeline, moment picker,
+# captions and SFX are untouched.
 FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -24,6 +29,12 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY server.py /app/server.py
 COPY static /app/static
+
+# 2b. 720p canvas patch (see header). Applied to the cloned engine at build
+#     time; the script fails the build if the engine's templates.py ever
+#     changes shape, so a silent no-op is impossible.
+COPY apply-720p-canvas.py /app/apply-720p-canvas.py
+RUN python3 /app/apply-720p-canvas.py /opt/beyondgtaclips/scripts/bgt/templates.py
 
 # 3. Engine setup: system-python mode (packages into ~/.beyondgtaclips/packages,
 #    Whisper tiny+base ~220 MB + YuNet face model). Needs ffmpeg + a JS runtime first.

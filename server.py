@@ -227,6 +227,8 @@ def _run_job(job):
         settings_path.write_text(json.dumps({"clean_captions": p["captions"],
                                              "caption_model": "tiny",
                                              "video_height": 720,
+                                             "width": 720,
+                                             "height": 1280,
                                              "x264_preset": "veryfast",
                                              "punch_ins": False}), encoding="utf-8")
         if p.get("source_type") == "upload":
