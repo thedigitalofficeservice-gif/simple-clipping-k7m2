@@ -18,7 +18,7 @@ transcript) — no cloud AI, no API keys.
 Routes:
   GET  /                        -> simple frontend
   GET  /healthz                 -> liveness
-  POST /api/jobs                -> start a clipping job (form: link)
+  POST /api/jobs                -> start a clipping job (form: link or file upload)
   GET  /api/jobs                -> list of jobs (newest first)
   GET  /api/jobs/{id}           -> job status + progress + log tail
   POST /api/jobs/{id}/cancel
@@ -39,7 +39,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -55,6 +55,8 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 JOB_TTL_HOURS = float(os.environ.get("JOB_TTL_HOURS", "168"))   # 7 days
 MAX_JOBS_BYTES = int(os.environ.get("MAX_JOBS_BYTES", str(2 * 1024 ** 3)))  # 2 GB
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
+ALLOWED_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg", ".avi"}
 
 # One fixed recipe: 6 short clips, auto style, clean-ish captions.
 RECIPE = {"clips": 6, "length": "short", "style": "auto",
@@ -208,14 +210,27 @@ def _run_job(job):
     job_dir = JOBS_DIR / jid
     p = job["params"]
     start_ts = time.time()
+    local_server = None
     try:
         job["status"] = "running"
         job["stage"] = "Starting"
         job["progress"] = 2
         settings_path = ENGINE_HOME / "settings.json"
         settings_path.write_text(json.dumps({"clean_captions": p["captions"]}), encoding="utf-8")
+        if p.get("source_type") == "upload":
+            # Serve the uploaded file on localhost and hand the engine an
+            # http(s) URL, because yt-dlp (the engine's downloader) fetches by URL.
+            from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+            from functools import partial
+            handler = partial(SimpleHTTPRequestHandler, directory=str(job_dir))
+            local_server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=local_server.serve_forever, daemon=True).start()
+            port = local_server.server_address[1]
+            source = f"http://127.0.0.1:{port}/{p['source_file']}"
+        else:
+            source = p["url"]
         cmd = [sys.executable, str(ENGINE_DIR / "scripts" / "beyondgtaclips.py"),
-               "clip", p["url"],
+               "clip", source,
                "--total", str(p["clips"]),
                "--styles", p["style"],
                "--length", p["length"],
@@ -281,6 +296,8 @@ def _run_job(job):
         job["stage"] = "Failed"
         job["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        if local_server:
+            local_server.shutdown()
         _save_manifest(job)
         current_proc.pop(jid, None)
 
@@ -309,15 +326,55 @@ def healthz():
 
 
 @app.post("/api/jobs")
-async def create_job(link: str = Form("")):
-    link = (link or "").strip()
-    if not re.match(r"^https?://", link):
-        raise HTTPException(400, "paste a full http(s) video link")
+async def create_job(link: str = Form(""), upload: UploadFile = File(None)):
     jid = uuid.uuid4().hex[:12]
     job_dir = JOBS_DIR / jid
     job_dir.mkdir(parents=True, exist_ok=True)
     params = dict(RECIPE)
-    params.update(source_type="url", url=link)
+    if upload is not None and upload.filename:
+        ext = Path(upload.filename).suffix.lower()
+        if ext not in ALLOWED_EXTS:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(400, f"unsupported file type {ext or '(none)'}")
+        fname = f"source{ext}"
+        dest = job_dir / fname
+        size = 0
+        with dest.open("wb") as fh:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_MB * 1024 * 1024:
+                    dest.unlink(missing_ok=True)
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                    raise HTTPException(400, f"file over {MAX_UPLOAD_MB} MB")
+                fh.write(chunk)
+        # The engine refuses sources under ~1 minute. Fail fast with a
+        # clear message instead of running the engine for minutes.
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                "-of", "default=noprint_wrappers=1:nokey=1", str(dest)],
+                               capture_output=True, text=True, timeout=60)
+        try:
+            dur = float(probe.stdout.strip())
+        except ValueError:
+            dur = 0
+        if dur and dur < 65:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(
+                400, f"video is only {dur:.0f} seconds long — it must be at least "
+                     "1 minute long for the engine to find clips")
+        params.update(source_type="upload", source_file=fname,
+                      source_name=upload.filename)
+    elif (link or "").strip():
+        link = link.strip()
+        if not re.match(r"^https?://", link):
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(400, "paste a full http(s) video link")
+        params.update(source_type="url", url=link)
+    else:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, "paste a video link or upload a video file")
     job = {"id": jid, "status": "queued", "stage": "Queued", "progress": 0,
            "created_at": datetime.now().isoformat(timespec="seconds"),
            "created_ts": time.time(), "params": params, "log": [], "clips": None,
