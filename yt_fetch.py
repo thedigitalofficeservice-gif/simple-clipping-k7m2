@@ -36,10 +36,20 @@ an idea discussed, never implemented. The only caches in the engine
 are intermediate results (meta.json, storyboard.npz, chat.json) that
 only help AFTER a download.
 
-No login, no cookies, no API key, no payment. The downloaded file is
-capped at MAX_FETCH_MB (default 500 MB) and requested at 720p or
-below, because the engine renders 720p clips anyway.
+UPDATE (22 Nov 2026): authenticated requests bypass the wall —
+YouTube trusts a logged-in session, so the rate limit no longer
+applies. A SEPARATE throwaway YouTube account ("Simple Clipper",
+created only for this, never the user's main account) is used, under
+the user's 8 conditions: cookies only for fetching + clipping, never
+in the frontend / repo / logs, backend-only, no other activity, delete
+after use. Its cookies.txt (Netscape format, exported by the user) is
+stored base64-encoded in the YTDLP_COOKIES_B64 env var on the server
+only — never in the repo or chat. At runtime it is decoded to a 0600
+temp file and passed to yt-dlp with --cookies. No API key, no payment.
+The downloaded file is capped at MAX_FETCH_MB (default 500 MB) and
+requested at 720p or below, because the engine renders 720p clips anyway.
 """
+import base64
 import json
 import os
 import re
@@ -99,6 +109,33 @@ def is_youtube_url(url):
 def video_id(url):
     m = YOUTUBE_RE.search(url or "")
     return m.group(1) if m else None
+
+
+def _cookies_file():
+    """Decode YTDLP_COOKIES_B64 (base64 Netscape cookies.txt) to a 0600
+    temp file and return its path, or None if not configured / invalid.
+
+    The env var holds the separate throwaway account's cookies only.
+    The decoded file lives in /tmp (never in the repo) and is only
+    passed to yt-dlp via --cookies. Returns None on any problem so
+    the caller falls back to the unauthenticated multi-client loop.
+    """
+    b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+    if not b64:
+        return None
+    try:
+        data = base64.b64decode(b64, validate=True)
+    except Exception:
+        return None
+    if b"# Netscape HTTP Cookie File" not in data[:200]:
+        return None
+    path = Path("/tmp") / "yt-cookies.txt"
+    try:
+        path.write_bytes(data)
+        os.chmod(path, 0o600)
+    except Exception:
+        return None
+    return path
 
 
 class FetchError(Exception):
@@ -207,13 +244,15 @@ def _invidious(vid, dest, note):
     raise FetchError("Invidious: all instances failed")
 
 
-def _ytdlp(url, dest, note, client, retries=True):
+def _ytdlp(url, dest, note, client, retries=True, cookies=None):
     """The engine's own yt-dlp, with a chosen player client.
 
     Retries with backoff when YouTube answers with the bot wall
     (LOGIN_REQUIRED / "Sign in to confirm you're not a bot"): that is
     the per-client rate limit, and it recovers after a short cooldown.
     A retry right away would just spend quota again, so we wait.
+    When `cookies` (a Netscape cookies.txt path) is given, it is
+    passed via --cookies: an authenticated session bypasses the wall.
     """
     packages = Path.home() / ".beyondgtaclips" / "packages"
     env = dict(os.environ)
@@ -229,6 +268,9 @@ def _ytdlp(url, dest, note, client, retries=True):
             "-o", str(dest), url]
     if client:
         args[4:4] = ["--extractor-args", f"youtube:player_client={client}"]
+    if cookies:
+        # Insert --cookies just before the URL (last element).
+        args[-1:-1] = ["--cookies", str(cookies)]
     label = f"yt-dlp ({client or 'default'})"
     delays = list(RETRY_DELAYS) if retries else []
     attempt = 0
@@ -278,6 +320,11 @@ def fetch_youtube(url, dest_dir, note):
     vid = video_id(url)
     title = ""
     errors = []
+    # Authenticated session (separate throwaway account) bypasses the
+    # per-IP rate limit. Decoded once per fetch from YTDLP_COOKIES_B64.
+    cookies = _cookies_file()
+    if cookies:
+        note("using saved YouTube login (separate account) for the fetch")
     # Pass 1: every player client once, no waits. A failed attempt
     # answers in seconds, so this whole pass takes ~1-2 min and
     # succeeds as soon as ANY client still has quota. cobalt /
@@ -288,7 +335,8 @@ def fetch_youtube(url, dest_dir, note):
         if dest.exists():
             dest.unlink()
         try:
-            title = _ytdlp(url, dest, note, client, retries=False) or title
+            title = _ytdlp(url, dest, note, client, retries=False,
+                           cookies=cookies) or title
             if dest.exists() and dest.stat().st_size >= 100_000:
                 note(f"YouTube video fetched via yt-dlp {client} ({title or 'untitled'})")
                 return dest, title
@@ -303,7 +351,8 @@ def fetch_youtube(url, dest_dir, note):
     if dest.exists():
         dest.unlink()
     try:
-        title = _ytdlp(url, dest, note, "visionos", retries=True) or title
+        title = _ytdlp(url, dest, note, "visionos", retries=True,
+                       cookies=cookies) or title
         if dest.exists() and dest.stat().st_size >= 100_000:
             note(f"YouTube video fetched via yt-dlp visionos (retry) ({title or 'untitled'})")
             return dest, title
