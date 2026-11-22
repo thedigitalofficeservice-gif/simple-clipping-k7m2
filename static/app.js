@@ -27,7 +27,7 @@ async function fetchYoutubeInBrowser(url, onNote) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        context: { client: { clientName: "ANDROID", clientVersion: "19.09.37", androidSdkVersion: 30, hl: "en", gl: "US" } },
+        context: { client: { clientName: "ANDROID", clientVersion: "20.10.38", androidSdkVersion: 30, hl: "en", gl: "US" } },
         videoId: vid,
         playbackContext: { contentPlaybackContext: { vis: 0, splay: false, lact: [] } },
       }),
@@ -51,6 +51,36 @@ async function fetchYoutubeInBrowser(url, onNote) {
   if (!blob || blob.size < 100000) return null;
   onNote(`Downloaded ${(blob.size / 1024 / 1024).toFixed(1)} MB in your browser, uploading it for clipping...`);
   return new File([blob], `youtube-${vid}.mp4`, { type: "video/mp4" });
+}
+
+// ---- Helper extension (installed in the visitor's browser) ----
+// If the free "Simple Clipping Helper" extension is installed, it can
+// fetch a YouTube video directly (an extension is allowed to contact
+// youtube.com; a plain web page is not), upload it to the server, and
+// hand us the job id. The page talks to the extension through
+// window.postMessage; the extension signals it is present by setting
+// data-sc-ext="ready" on <html>.
+function extensionReady() {
+  return document.documentElement.getAttribute("data-sc-ext") === "ready";
+}
+function fetchYoutubeViaExtension(url, onNote) {
+  return new Promise((resolve) => {
+    const requestId = "sc" + Date.now() + Math.random().toString(36).slice(2, 8);
+    const timer = setTimeout(() => { window.removeEventListener("message", onMsg); resolve(null); }, 600000);
+    function onMsg(event) {
+      if (event.source !== window) return;
+      const d = event.data || {};
+      if (d.requestId !== requestId) return;
+      if (d.type === "SC_FETCH_YOUTUBE_NOTE") { onNote(d.note); return; }
+      if (d.type !== "SC_FETCH_YOUTUBE_RESULT") return;
+      clearTimeout(timer);
+      window.removeEventListener("message", onMsg);
+      if (d.ok && d.jobId) resolve(d.jobId);
+      else { if (d.error) onNote("Extension: " + d.error); resolve(null); }
+    }
+    window.addEventListener("message", onMsg);
+    window.postMessage({ type: "SC_FETCH_YOUTUBE", url, requestId }, "*");
+  });
 }
 
 async function api(path, opts = {}) {
@@ -80,6 +110,25 @@ $("start-btn").addEventListener("click", async () => {
       $("progress-stage").textContent = "Downloading it in your browser first (your home connection is not blocked by YouTube).";
       $("progress-log").textContent = "";
       const note = (s) => { $("progress-log").textContent += s + "\n"; $("progress-log").scrollTop = 1e9; };
+      // 1) Helper extension (if installed): it fetches the video with
+      // your home IP and uploads it, returning a job id. If it works,
+      // the job already exists — go straight to polling it.
+      if (extensionReady()) {
+        note("Helper extension found — fetching the video through it...");
+        const jobId = await fetchYoutubeViaExtension(link, note);
+        if (jobId) {
+          currentJob = jobId;
+          $("progress-title").textContent = "Clipping…";
+          $("progress-bar").style.width = "0%";
+          $("progress-stage").textContent = "The video was fetched in your browser — clipping now.";
+          $("results").innerHTML = "";
+          poll();
+          $("start-btn").disabled = false;
+          return;
+        }
+        note("Extension could not fetch it — trying the browser directly.");
+      }
+      // 2) Direct browser fetch (works only if YouTube allows it).
       const fetched = await fetchYoutubeInBrowser(link, note);
       if (fetched) {
         file = fetched;
