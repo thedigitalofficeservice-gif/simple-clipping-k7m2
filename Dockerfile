@@ -36,6 +36,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY server.py /app/server.py
 COPY phase1.py /app/phase1.py
+COPY yt_fetch.py /app/yt_fetch.py
 COPY static /app/static
 
 # 2b. 720p canvas patch (see header). Applied to the cloned engine at build

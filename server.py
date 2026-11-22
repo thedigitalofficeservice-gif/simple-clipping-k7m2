@@ -22,6 +22,14 @@ engine's own `remake` re-renders in a fresh process) because the
 single-process run peaks at ~777 MB and the render's ffmpeg is OOM-killed
 on 1 GB; Phase 1 peaks at ~611 MB, Phase 2 at ~328 MB.
 
+YouTube URLs are fetched to a local file FIRST (yt_fetch.py) and then
+handed to the engine like an upload, because YouTube serves a sign-in/bot
+wall to the engine's yt-dlp on Railway's datacenter IP. The YouTube Data
+API cannot fix that — an API key only returns metadata, never the video
+file. yt_fetch tries cobalt, Invidious, then yt-dlp's TV client, and the
+first one that produces a real file wins. Non-YouTube URLs are still
+passed to the engine directly, unchanged.
+
 Routes:
   GET  /                        -> simple frontend
   GET  /healthz                 -> liveness
@@ -49,6 +57,11 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
+try:
+    import yt_fetch
+except ImportError:  # pragma: no cover - yt_fetch.py ships with the app
+    yt_fetch = None
 
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
@@ -281,6 +294,29 @@ def _run_job(job):
             threading.Thread(target=local_server.serve_forever, daemon=True).start()
             port = local_server.server_address[1]
             source = f"http://127.0.0.1:{port}/{p['source_file']}"
+        elif yt_fetch is not None and yt_fetch.is_youtube_url(p.get("url", "")):
+            # YouTube is walled to the engine's yt-dlp on Railway's IP, so
+            # fetch the video to a local file first (yt_fetch.py) and hand
+            # the engine that file, exactly like an upload. The engine,
+            # the recipe and the two-phase split are untouched.
+            _note(job, "Fetching the YouTube video (YouTube blocks this "
+                       "server's direct download, so fetching via a "
+                       "downloader service first)...")
+            try:
+                _fpath, _title = yt_fetch.fetch_youtube(
+                    p["url"], job_dir, lambda line: _note(job, line))
+            except yt_fetch.FetchError as exc:
+                job["status"] = "failed"
+                job["stage"] = "Failed"
+                job["error"] = str(exc)
+                return
+            from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+            from functools import partial
+            handler = partial(SimpleHTTPRequestHandler, directory=str(job_dir))
+            local_server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=local_server.serve_forever, daemon=True).start()
+            port = local_server.server_address[1]
+            source = f"http://127.0.0.1:{port}/source.mp4"
         else:
             source = p["url"]
         # TWO PHASES (see phase1.py + Dockerfile header): the single-process
