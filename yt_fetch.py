@@ -1,48 +1,57 @@
 #!/usr/bin/env python3
 """Fetch a YouTube video to a local file, from a datacenter IP.
 
-YouTube serves a sign-in/bot wall to yt-dlp on Railway's datacenter IP
-("Sign in to confirm you're not a bot") for EVERY video, so the engine's
-own yt-dlp cannot fetch a YouTube URL there. The YouTube Data API cannot
-fix this: an API key only returns metadata (title, duration) — it never
-returns the video file or a stream URL. And "caching" cannot fix it
-either: caching only helps once a video has been downloaded, and the
-download itself is what is blocked.
+DIAGNOSIS (22 Nov 2026, evidence in the job logs + live tests):
+YouTube does NOT permanently block the server's IP. It rate-limits the
+InnerTube player API (youtubei/v1/player) per IP + per player client.
+When the quota is exhausted the API returns a 200 with
+playabilityStatus LOGIN_REQUIRED ("Sign in to confirm you're not a
+bot") and NO stream URLs — not an HTTP 403 or 429, not a CAPTCHA, and
+the watch page itself still loads (HTTP 200) but its embedded player
+response is the same LOGIN_REQUIRED stub with zero formats. The quota
+recovers after a short cooldown (~2-3 min): the same video, tool and
+client failed at 12:32 PKT and succeeded at 12:35 PKT on this VM, then
+failed again immediately after the success (quota spent), proving it
+is a tight per-client rate limit, not a permanent ban. Railway's shared
+egress IPs are used by thousands of apps, so their quota is almost
+always exhausted — that is why yt-dlp fails consistently there, while
+the less-shared VM IP works intermittently.
 
-So this helper fetches the video through services that already do the
-YouTube download on their own servers, then hands the engine a LOCAL file
-(the same path the upload flow uses, which already works on Railway).
-No login, no cookies, no API key, no payment. Methods are tried in order
-and the first one that produces a real file wins; every attempt is logged
-so a failed job shows exactly what was tried.
+So the fix is NOT another server. It is: use the least-used player
+client first (visionos — a new client, far less hammered than web/tv),
+and RETRY WITH BACKOFF when the API answers LOGIN_REQUIRED, giving
+the quota time to recover. One client, a few spaced retries, no
+rapid-fire attempts (each failed attempt spends quota).
 
-  1. cobalt (https://co.api) — a free downloader API: POST the YouTube
-     URL, get back a direct download link, fetch the file. Fallback
-     instances are tried if the main one is unreachable.
-  2. Invidious API — GET /api/v1/videos/<id> from a list of public
-     instances, take a formatStreams URL (a direct googlevideo.com link)
-     and fetch the file. Instances are often behind bot-checks, so this
-     is a fallback, not the primary route.
-  3. yt-dlp with the TV player client — the engine's own downloader with
-     player_client=tv (smart-TV clients are sometimes treated
-     differently from the web client). Kept as a last resort; the web /
-     android / ios clients are already known to be walled on Railway.
-  4. yt-dlp with the default (web) client — the current behaviour.
+The YouTube Data API cannot fix this: an API key only returns
+metadata (title, duration) — it never returns the video file or a
+stream URL. And "caching" cannot fix it either: caching only helps
+once a video has been downloaded, and the download itself is what is
+blocked. No API-key / Data-API / video-cache solution exists anywhere
+in this project's code or history (verified by full search) — it was
+an idea discussed, never implemented. The only caches in the engine
+are intermediate results (meta.json, storyboard.npz, chat.json) that
+only help AFTER a download.
 
-The downloaded file is capped at MAX_FETCH_MB (default 500 MB, the same
-as the upload limit) and is requested at 720p or below, because the
-engine renders 720p clips anyway. Very long videos (multi-hour
-livestream recordings) may exceed the cap; the job then fails with a
-clear message instead of filling the disk.
+No login, no cookies, no API key, no payment. The downloaded file is
+capped at MAX_FETCH_MB (default 500 MB) and requested at 720p or
+below, because the engine renders 720p clips anyway.
 """
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# Retry delays (seconds) after a bot-wall / LOGIN_REQUIRED answer.
+# The quota recovers after ~2-3 min; spaced retries let it come back.
+# Longer processing wait is acceptable (user's own terms).
+RETRY_DELAYS = [60, 90, 120]
+BOT_WALL_MARKERS = ("Sign in to confirm", "LOGIN_REQUIRED", "not a bot")
 
 MAX_FETCH_MB = int(os.environ.get("MAX_FETCH_MB", "500"))
 MAX_BYTES = MAX_FETCH_MB * 1024 * 1024
@@ -187,8 +196,14 @@ def _invidious(vid, dest, note):
     raise FetchError("Invidious: all instances failed")
 
 
-def _ytdlp(url, dest, note, client):
-    """Method 3/4: the engine's own yt-dlp, with a chosen player client."""
+def _ytdlp(url, dest, note, client, retries=True):
+    """The engine's own yt-dlp, with a chosen player client.
+
+    Retries with backoff when YouTube answers with the bot wall
+    (LOGIN_REQUIRED / "Sign in to confirm you're not a bot"): that is
+    the per-client rate limit, and it recovers after a short cooldown.
+    A retry right away would just spend quota again, so we wait.
+    """
     packages = Path.home() / ".beyondgtaclips" / "packages"
     env = dict(os.environ)
     if packages.exists():
@@ -203,25 +218,41 @@ def _ytdlp(url, dest, note, client):
             "-o", str(dest), url]
     if client:
         args[4:4] = ["--extractor-args", f"youtube:player_client={client}"]
-    note(f"trying yt-dlp (player client {client or 'default'}) ...")
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=600, env=env)
-    tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
-    # yt-dlp may still append an extension (e.g. source.mp4.webm) if the
-    # merge format flag is ignored; accept any file it actually wrote.
-    actual = dest if dest.exists() else None
-    if actual is None:
-        for cand in sorted(dest.parent.glob(dest.name + ".*")):
-            if cand.is_file() and cand.stat().st_size >= 100_000:
-                actual = cand
-                break
-    if proc.returncode != 0 or actual is None or actual.stat().st_size < 100_000:
-        raise FetchError("yt-dlp " + (client or "default") + " failed: "
-                         + " | ".join(tail)[:300])
-    if actual != dest:
-        actual.replace(dest)
-    note(f"yt-dlp ({client or 'default'}) downloaded "
-         f"{dest.stat().st_size / 1024 / 1024:.1f} MB")
-    return ""
+    label = f"yt-dlp ({client or 'default'})"
+    delays = list(RETRY_DELAYS) if retries else []
+    attempt = 0
+    while True:
+        attempt += 1
+        note(f"trying {label} (attempt {attempt}) ...")
+        proc = subprocess.run(args, capture_output=True, text=True,
+                              timeout=600, env=env)
+        tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
+        # yt-dlp may still append an extension (e.g. source.mp4.webm) if the
+        # merge format flag is ignored; accept any file it actually wrote.
+        actual = dest if dest.exists() else None
+        if actual is None:
+            for cand in sorted(dest.parent.glob(dest.name + ".*")):
+                if cand.is_file() and cand.stat().st_size >= 100_000:
+                    actual = cand
+                    break
+        if proc.returncode == 0 and actual is not None \
+                and actual.stat().st_size >= 100_000:
+            if actual != dest:
+                actual.replace(dest)
+            note(f"{label} downloaded "
+                 f"{dest.stat().st_size / 1024 / 1024:.1f} MB")
+            return ""
+        err = " | ".join(tail)[:300]
+        is_wall = any(m in err for m in BOT_WALL_MARKERS)
+        if is_wall and delays:
+            wait = delays.pop(0)
+            note(f"{label} hit YouTube's rate limit (bot wall) — "
+                 f"waiting {wait}s for the quota to recover, then retrying ...")
+            time.sleep(wait)
+            if dest.exists():
+                dest.unlink()
+            continue
+        raise FetchError(f"{label} failed: {err}")
 
 
 def fetch_youtube(url, dest_dir, note):
@@ -236,10 +267,21 @@ def fetch_youtube(url, dest_dir, note):
     vid = video_id(url)
     title = ""
     errors = []
-    for name, fn in (("cobalt", lambda: _cobalt(url, dest, note)),
-                     ("invidious", lambda: _invidious(vid, dest, note)),
-                     ("yt-dlp tv", lambda: _ytdlp(url, dest, note, "tv")),
-                     ("yt-dlp", lambda: _ytdlp(url, dest, note, None))):
+    # Order matters: visionos first (newest, least-used client — the
+    # one that actually got through on 22 Nov), then tv, then android.
+    # cobalt / Invidious are NOT tried: their public instances are
+    # unreachable (DNS fail / HTTP 403) and the self-hosted cobalt hits
+    # the same YouTube rate limit, so they only waste time and quota.
+    # Each client gets spaced retries inside _ytdlp (backoff) so the
+    # per-client quota can recover instead of failing at once.
+    for name, fn in (("yt-dlp visionos",
+                      lambda: _ytdlp(url, dest, note, "visionos")),
+                     ("yt-dlp tv",
+                      lambda: _ytdlp(url, dest, note, "tv",
+                                     retries=False)),
+                     ("yt-dlp android",
+                      lambda: _ytdlp(url, dest, note, "android",
+                                     retries=False))):
         if dest.exists():
             dest.unlink()
         try:
