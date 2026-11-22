@@ -17,11 +17,14 @@ egress IPs are used by thousands of apps, so their quota is almost
 always exhausted — that is why yt-dlp fails consistently there, while
 the less-shared VM IP works intermittently.
 
-So the fix is NOT another server. It is: use the least-used player
-client first (visionos — a new client, far less hammered than web/tv),
-and RETRY WITH BACKOFF when the API answers LOGIN_REQUIRED, giving
-the quota time to recover. One client, a few spaced retries, no
-rapid-fire attempts (each failed attempt spends quota).
+So the fix is NOT another server, browser, or extension. It is:
+use MANY player clients, because the limit is per IP + per client —
+a rarely-used client may still have quota when the popular ones are
+exhausted. The fetch tries each client once (a failed attempt answers
+in seconds, so the whole pass takes ~1-2 min); if none works, the
+least-used client (visionos) is retried with backoff so its quota can
+recover. No rapid-fire attempts on one client (each failed attempt
+spends quota).
 
 The YouTube Data API cannot fix this: an API key only returns
 metadata (title, duration) — it never returns the video file or a
@@ -46,6 +49,14 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# Player clients to try, least-used first. YouTube rate-limits the
+# player API per IP + per player client, so a rarely-used client may
+# still have quota when the popular ones are exhausted. Each client is
+# tried once (a failed attempt answers in seconds); if none works,
+# visionos is retried with backoff so its quota can recover.
+YT_CLIENTS = ["visionos", "tv_embedded", "web_embedded", "web_safari",
+              "tv", "ios", "android", "web"]
 
 # Retry delays (seconds) after a bot-wall / LOGIN_REQUIRED answer.
 # The quota recovers after ~2-3 min; spaced retries let it come back.
@@ -267,33 +278,40 @@ def fetch_youtube(url, dest_dir, note):
     vid = video_id(url)
     title = ""
     errors = []
-    # Order matters: visionos first (newest, least-used client — the
-    # one that actually got through on 22 Nov), then tv, then android.
-    # cobalt / Invidious are NOT tried: their public instances are
-    # unreachable (DNS fail / HTTP 403) and the self-hosted cobalt hits
-    # the same YouTube rate limit, so they only waste time and quota.
-    # Each client gets spaced retries inside _ytdlp (backoff) so the
-    # per-client quota can recover instead of failing at once.
-    for name, fn in (("yt-dlp visionos",
-                      lambda: _ytdlp(url, dest, note, "visionos")),
-                     ("yt-dlp tv",
-                      lambda: _ytdlp(url, dest, note, "tv",
-                                     retries=False)),
-                     ("yt-dlp android",
-                      lambda: _ytdlp(url, dest, note, "android",
-                                     retries=False))):
+    # Pass 1: every player client once, no waits. A failed attempt
+    # answers in seconds, so this whole pass takes ~1-2 min and
+    # succeeds as soon as ANY client still has quota. cobalt /
+    # Invidious are NOT tried: their public instances are unreachable
+    # (DNS fail / HTTP 403) and the self-hosted cobalt hits the same
+    # YouTube rate limit, so they only waste time and quota.
+    for client in YT_CLIENTS:
         if dest.exists():
             dest.unlink()
         try:
-            title = fn() or title
+            title = _ytdlp(url, dest, note, client, retries=False) or title
             if dest.exists() and dest.stat().st_size >= 100_000:
-                note(f"YouTube video fetched via {name} ({title or 'untitled'})")
+                note(f"YouTube video fetched via yt-dlp {client} ({title or 'untitled'})")
                 return dest, title
         except FetchError as e:
-            errors.append(f"{name}: {e}")
-            note(f"{name} failed: {e}")
+            errors.append(f"yt-dlp {client}: {e}")
+            note(f"yt-dlp {client} failed: {e}")
         except Exception as e:  # noqa: BLE001 - keep trying the next method
-            errors.append(f"{name}: {type(e).__name__}: {e}")
-            note(f"{name} failed: {type(e).__name__}: {e}")
+            errors.append(f"yt-dlp {client}: {type(e).__name__}: {e}")
+            note(f"yt-dlp {client} failed: {type(e).__name__}: {e}")
+    # Pass 2: visionos (least-used client) with spaced retries, so its
+    # quota can recover.
+    if dest.exists():
+        dest.unlink()
+    try:
+        title = _ytdlp(url, dest, note, "visionos", retries=True) or title
+        if dest.exists() and dest.stat().st_size >= 100_000:
+            note(f"YouTube video fetched via yt-dlp visionos (retry) ({title or 'untitled'})")
+            return dest, title
+    except FetchError as e:
+        errors.append(f"yt-dlp visionos (retry): {e}")
+        note(f"yt-dlp visionos (retry) failed: {e}")
+    except Exception as e:  # noqa: BLE001 - report the failure
+        errors.append(f"yt-dlp visionos (retry): {type(e).__name__}: {e}")
+        note(f"yt-dlp visionos (retry) failed: {type(e).__name__}: {e}")
     raise FetchError("YouTube could not be fetched from this server. "
                      "Tried: " + " | ".join(errors)[:800])
