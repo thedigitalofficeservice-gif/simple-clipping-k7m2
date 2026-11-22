@@ -9,11 +9,18 @@ Finished clips are saved on the server for 7 days and listed under
 "Your clips", so you can watch and download them later, including on mobile
 (the Download button saves the MP4 to the phone).
 
-The clipping itself is done by the UNMODIFIED BeyondGTAClips engine
-(official repo, fetched at image build time), called as a subprocess.
-No engine code is copied, rebranded or sold. Moments are picked by the
-engine's signal picker (loudness + chat + screen activity + Whisper
-transcript) — no cloud AI, no API keys.
+The clipping itself is done by the BeyondGTAClips engine (official repo,
+fetched at image build time), called as a subprocess. No engine code is
+copied, rebranded or sold. Moments are picked by the engine's signal picker
+(loudness + chat + screen activity + Whisper transcript) — no cloud AI, no
+API keys. Two minimal build-time patches keep it inside Railway's 1 GB
+(see Dockerfile + apply-720p-canvas.py + apply-frame-float32.py): a 720p
+render canvas and float32 frame-analysis means; the pipeline, picker,
+captions and SFX are untouched. The engine runs in TWO phases (phase1.py
+does download/listen/pick/prepare with the render stubbed out, then the
+engine's own `remake` re-renders in a fresh process) because the
+single-process run peaks at ~777 MB and the render's ffmpeg is OOM-killed
+on 1 GB; Phase 1 peaks at ~611 MB, Phase 2 at ~328 MB.
 
 Routes:
   GET  /                        -> simple frontend
@@ -129,7 +136,7 @@ def _job_public(j):
     }
 
 
-def _note(job, line):
+def _note(job, line, cap=None):
     line = line.rstrip("\n")
     if not line.strip():
         return
@@ -137,9 +144,42 @@ def _note(job, line):
     low = line.lower()
     for key, (stage, pct) in STAGE_MAP:
         if key in low:
+            if cap is not None and pct > cap:
+                # Phase 1 must never show "Done"/100% — the render
+                # (Phase 2) is still to come.
+                pct = cap
+                if key == "done:":
+                    stage = "Moments picked — rendering clips"
             job["stage"] = stage
             job["progress"] = max(job["progress"], pct)
             break
+
+
+def _run_cmd(job, cmd, env, cwd, cap=None):
+    """Run one engine subprocess, streaming its output to the job log.
+    Returns the exit code, or None if the user cancelled the job."""
+    jid = job["id"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            cwd=str(cwd), env=env, start_new_session=True)
+    current_proc[jid] = proc
+    try:
+        for line in proc.stdout:
+            _note(job, line, cap=cap)
+            if job.get("cancel_requested"):
+                break
+        if job.get("cancel_requested"):
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:
+                pass
+            proc.wait(timeout=30)
+            job["status"] = "cancelled"
+            job["stage"] = "Cancelled"
+            return None
+        return proc.wait()
+    finally:
+        current_proc.pop(jid, None)
 
 
 def _job_size(jid):
@@ -219,10 +259,9 @@ def _run_job(job):
         # (per-job, jobs run one at a time). Low-memory settings for the
         # free 1GB Railway server: Whisper "tiny" for captions (instead of
         # "base"), 720p source slices, a faster x264 preset and no
-        # punch-in zooms, so the render step fits in 1 GB RAM. The render
-        # canvas itself is 1080x1920 by the engine's design. These are the
-        # engine's own documented settings.json knobs — the engine itself
-        # is untouched.
+        # punch-in zooms. The render canvas itself is 1080x1920 by the
+        # engine's design (scaled to 720x1280 by the build-time patch).
+        # These are the engine's own documented settings.json knobs.
         settings_path = ENGINE_HOME / "settings.json"
         settings_path.write_text(json.dumps({"clean_captions": p["captions"],
                                              "caption_model": "tiny",
@@ -244,41 +283,53 @@ def _run_job(job):
             source = f"http://127.0.0.1:{port}/{p['source_file']}"
         else:
             source = p["url"]
-        cmd = [sys.executable, str(ENGINE_DIR / "scripts" / "beyondgtaclips.py"),
-               "clip", source,
-               "--total", str(p["clips"]),
-               "--styles", p["style"],
-               "--length", p["length"],
-               "--brain", "none",
-               "--topic", p["topic"]]
+        # TWO PHASES (see phase1.py + Dockerfile header): the single-process
+        # run peaks at ~777 MB and the render's ffmpeg is OOM-killed on
+        # Railway's 1 GB. Phase 1 does download/listen/pick/prepare with the
+        # render stubbed out (peak ~611 MB); Phase 2 (the engine's own
+        # `remake`) re-renders in a fresh process (peak ~328 MB). Same
+        # moments, same templates, same 720p clips — just split in two.
         env = dict(os.environ, BEYONDGTACLIPS_HOME=str(ENGINE_HOME),
-                   PYTHONIOENCODING="utf-8")
-        _note(job, "Running the clipping engine...")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, encoding="utf-8", errors="replace",
-                                cwd=str(ENGINE_DIR), env=env, start_new_session=True)
-        current_proc[jid] = proc
-        for line in proc.stdout:
-            _note(job, line)
-            if job.get("cancel_requested"):
-                break
-        if job.get("cancel_requested"):
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except Exception:
-                pass
-            proc.wait(timeout=30)
-            job["status"] = "cancelled"
-            job["stage"] = "Cancelled"
+                   ENGINE_DIR=str(ENGINE_DIR), PYTHONIOENCODING="utf-8")
+        clip_args = ["clip", source,
+                     "--total", str(p["clips"]),
+                     "--styles", p["style"],
+                     "--length", p["length"],
+                     "--brain", "none",
+                     "--topic", p["topic"]]
+        _note(job, "Running the clipping engine (phase 1: finding moments)...")
+        code1 = _run_cmd(job, [sys.executable, str(BASE / "phase1.py"), *clip_args],
+                         env, ENGINE_DIR, cap=60)
+        if code1 is None:  # cancelled
             return
-        code = proc.wait()
-        outdir = _find_output(start_ts, p["topic"])
-        if code != 0 or outdir is None:
+        if code1 != 0:
             tail = "\n".join(job["log"][-12:])
             job["status"] = "failed"
             job["stage"] = "Failed"
-            job["error"] = ("The engine stopped without finished clips "
-                            f"(exit {code}). Last output:\n{tail}")
+            job["error"] = ("Phase 1 (finding moments) stopped without finished clips "
+                            f"(exit {code1}). Last output:\n{tail}")
+            return
+        outdir = _find_output(start_ts, p["topic"])
+        if outdir is None:
+            tail = "\n".join(job["log"][-12:])
+            job["status"] = "failed"
+            job["stage"] = "Failed"
+            job["error"] = ("Phase 1 finished but no clip folder was found. "
+                            f"Last output:\n{tail}")
+            return
+        _note(job, "Moments picked — rendering clips (phase 2)...")
+        code2 = _run_cmd(job, [sys.executable,
+                               str(ENGINE_DIR / "scripts" / "beyondgtaclips.py"),
+                               "remake", str(outdir)],
+                         env, ENGINE_DIR)
+        if code2 is None:  # cancelled
+            return
+        if code2 != 0:
+            tail = "\n".join(job["log"][-12:])
+            job["status"] = "failed"
+            job["stage"] = "Failed"
+            job["error"] = ("Phase 2 (rendering clips) stopped without finished clips "
+                            f"(exit {code2}). Last output:\n{tail}")
             return
         data = json.loads((outdir / "clips.json").read_text(encoding="utf-8"))
         clips = []
