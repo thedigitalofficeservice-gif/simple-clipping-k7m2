@@ -1,6 +1,58 @@
 const $ = (id) => document.getElementById(id);
 let currentJob = null, pollTimer = null;
 
+// ---- Browser-side YouTube fetch (the visitor's home IP) ----
+// YouTube blocks downloads from this server's datacenter IP (its
+// player API answers LOGIN_REQUIRED there), but it does NOT block a
+// normal home connection. So for a YouTube link we first fetch the
+// video right here in the visitor's browser — the request comes from
+// their home IP — then upload the downloaded file to the server for
+// clipping. If the browser cannot fetch it (e.g. the browser blocks
+// the request), we return null and the caller falls back to the
+// server-side fetch. No login, no cookies, no API key of ours: the
+// key below is YouTube's own public web-client key, the same one its
+// own pages use.
+const YT_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+function ytVideoId(url) {
+  const m = String(url || "").match(/(?:youtube\.com\/(?:watch\?[^#]*v=|live\/|shorts\/|embed\/|v\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+async function fetchYoutubeInBrowser(url, onNote) {
+  const vid = ytVideoId(url);
+  if (!vid) return null;
+  onNote("Fetching the video in your browser (your home connection)...");
+  let data;
+  try {
+    const r = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${YT_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        context: { client: { clientName: "ANDROID", clientVersion: "19.09.37", androidSdkVersion: 30, hl: "en", gl: "US" } },
+        videoId: vid,
+        playbackContext: { contentPlaybackContext: { vis: 0, splay: false, lact: [] } },
+      }),
+    });
+    if (!r.ok) return null;
+    data = await r.json();
+  } catch { return null; }
+  if ((data.playabilityStatus || {}).status !== "OK") return null;
+  const sd = data.streamingData || {};
+  const formats = [...(sd.formats || []), ...(sd.adaptiveFormats || [])];
+  const prog = formats.filter(f => f.mimeType && f.mimeType.includes("video/mp4") && f.url && f.height && f.height <= 720);
+  prog.sort((a, b) => (b.height || 0) - (a.height || 0));
+  if (!prog.length) return null;
+  onNote(`Found a ${prog[0].height}p stream, downloading it in your browser...`);
+  let blob;
+  try {
+    const r = await fetch(prog[0].url);
+    if (!r.ok) return null;
+    blob = await r.blob();
+  } catch { return null; }
+  if (!blob || blob.size < 100000) return null;
+  onNote(`Downloaded ${(blob.size / 1024 / 1024).toFixed(1)} MB in your browser, uploading it for clipping...`);
+  return new File([blob], `youtube-${vid}.mp4`, { type: "video/mp4" });
+}
+
 async function api(path, opts = {}) {
   const r = await fetch(path, opts);
   if (!r.ok) { const t = await r.text(); throw new Error(t || r.statusText); }
@@ -12,13 +64,33 @@ $("start-btn").addEventListener("click", async () => {
   const errEl = $("form-error");
   errEl.classList.add("hidden");
   const link = $("link").value.trim();
-  const file = $("file").files[0];
+  let file = $("file").files[0];
   if (!link && !file) { errEl.textContent = "Paste a video link or choose a video file first."; errEl.classList.remove("hidden"); return; }
   $("start-btn").disabled = true;
   try {
+    // YouTube links: fetch the video in THIS browser first (the
+    // visitor's home IP is not blocked by YouTube). If that works,
+    // upload the downloaded file; the server then clips it exactly
+    // like an uploaded video. If the browser cannot fetch it, fall
+    // back to the server-side link fetch.
+    if (link && !file && ytVideoId(link)) {
+      $("progress-card").classList.remove("hidden");
+      $("progress-title").textContent = "Fetching the YouTube video…";
+      $("progress-bar").style.width = "5%";
+      $("progress-stage").textContent = "Downloading it in your browser first (your home connection is not blocked by YouTube).";
+      $("progress-log").textContent = "";
+      const note = (s) => { $("progress-log").textContent += s + "\n"; $("progress-log").scrollTop = 1e9; };
+      const fetched = await fetchYoutubeInBrowser(link, note);
+      if (fetched) {
+        file = fetched;
+        note("Browser fetch worked — uploading the video for clipping.");
+      } else {
+        note("Browser fetch did not work here — trying the server instead.");
+      }
+    }
     const fd = new FormData();
-    if (link) fd.append("link", link);
     if (file) fd.append("upload", file);
+    else if (link) fd.append("link", link);
     const { id } = await api("/api/jobs", { method: "POST", body: fd });
     currentJob = id;
     $("progress-card").classList.remove("hidden");
