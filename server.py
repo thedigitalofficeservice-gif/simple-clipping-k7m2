@@ -82,15 +82,18 @@ ALLOWED_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg", ".avi"
 RECIPE = {"clips": 6, "length": "short", "style": "auto",
           "captions": "slurs", "topic": "Gaming", "focus": ""}
 
-# Long-video time range: max 30 minutes per job (the free 1 GB server
+# Long-video time range: max 5 minutes per job (the free 1 GB server
 # cannot process multi-hour livestreams whole — it runs out of memory).
 MAX_CLIP_MINUTES = 30
 
-# Entire-stream mode: a long video is split into 30-minute parts and
+# Entire-stream mode: a long video is split into 5-minute parts and
 # each part is clipped by the engine in turn (one at a time, same 1 GB
 # limit). Completed parts + their clips are saved after every part, so
 # a server restart resumes from the next unfinished part.
-SEGMENT_SECONDS = 1800
+# 5 minutes is the proven size: a live stream's audio makes Phase 1
+# (Whisper) run out of memory at 10+ min on this 1 GB server, even
+# though 30-min parts work for regular videos.
+SEGMENT_SECONDS = 300
 
 
 class EngineError(Exception):
@@ -413,7 +416,7 @@ def _run_job(job):
         env = dict(os.environ, BEYONDGTACLIPS_HOME=str(ENGINE_HOME),
                    ENGINE_DIR=str(ENGINE_DIR), PYTHONIOENCODING="utf-8")
         # Entire-stream mode (YouTube URL + checkbox): split the whole
-        # video into 30-minute parts and clip each part in turn. Handled
+        # video into 5-minute parts and clip each part in turn. Handled
         # by _run_stream_job (it saves progress after every part, so a
         # server restart resumes from the next unfinished part).
         if p.get("entire_stream") and p.get("source_type") == "url" \
@@ -491,7 +494,7 @@ def _run_job(job):
 
 
 def _run_stream_job(job, env):
-    """Entire-stream mode: split a long YouTube video into 30-minute
+    """Entire-stream mode: split a long YouTube video into 5-minute
     parts and clip each part in turn, collecting every part's clips
     into this one job. After every part the manifest is saved (which
     segments are done + the clips so far), so a server restart resumes
@@ -574,7 +577,7 @@ def _run_stream_job(job, env):
             _note(job, f"{label}: {_fmt_hms(seg_start)}–"
                        f"{_fmt_hms(seg_start + seg_dur)} ...")
             seg_ts = time.time()
-            # Fetch just this part (30 min, not the whole stream).
+            # Fetch just this part (5 min, not the whole stream).
             try:
                 yt_fetch.fetch_youtube(
                     url, job_dir, lambda line: _note(job, line),
@@ -685,7 +688,7 @@ async def create_job(link: str = Form(""), upload: UploadFile = File(None),
     job_dir.mkdir(parents=True, exist_ok=True)
     params = dict(RECIPE)
     # "Process Entire Stream" (YouTube URL only): split the whole video
-    # into 30-minute parts and clip each part in turn, collecting all
+    # into 5-minute parts and clip each part in turn, collecting all
     # clips into this one job. Progress is saved after every part.
     if (entire or "").strip().lower() in ("1", "on", "true", "yes"):
         params["entire_stream"] = True
