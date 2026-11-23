@@ -19,6 +19,8 @@ input:focus { outline:2px solid var(--accent); border-color:transparent; }
 .row input:first-child { flex:1 1 auto; min-width:0; }
 .row input:last-child { flex:0 0 110px; }
 .hint { color:var(--muted); font-size:13px; margin:0 0 12px; }
+.check { display:flex; gap:10px; align-items:flex-start; font-size:15px; font-weight:600; margin:2px 0 12px; cursor:pointer; }
+.check input { width:auto; margin:3px 0 0; accent-color:var(--accent); }
 .btn { border:0; border-radius:10px; padding:12px 18px; font-size:16px; font-weight:700; cursor:pointer; background:#232c38; color:var(--text); text-decoration:none; display:inline-block; }
 .btn.primary { background:var(--accent); color:#fff; width:100%; }
 .btn.big { padding:15px; font-size:17px; margin-top:6px; }

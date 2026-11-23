@@ -1,6 +1,14 @@
 const $ = (id) => document.getElementById(id);
 let currentJob = null, pollTimer = null;
 
+// Format seconds as H:MM:SS (for entire-stream clip timestamps).
+function fmtHMS(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+               : `${m}:${String(s).padStart(2, "0")}`;
+}
+
 // ---- Browser-side YouTube fetch (the visitor's home IP) ----
 // YouTube blocks downloads from this server's datacenter IP (its
 // player API answers LOGIN_REQUIRED there), but it does NOT block a
@@ -103,6 +111,11 @@ $("start-btn").addEventListener("click", async () => {
   const startVal = ($("start") ? $("start").value : "").trim();
   const minutesVal = ($("minutes") ? $("minutes").value : "").trim();
   const hasRange = startVal !== "" || (minutesVal !== "" && +minutesVal !== 30);
+  // Entire-stream mode: the server splits the whole video into
+  // 30-min parts and clips each part in turn. Skip the browser-side
+  // fetch (it would download the whole video) — the server fetches
+  // only one part at a time.
+  const entireStream = $("entire") ? $("entire").checked : false;
   $("start-btn").disabled = true;
   try {
     // YouTube links: fetch the video in THIS browser first (the
@@ -110,8 +123,9 @@ $("start-btn").addEventListener("click", async () => {
     // upload the downloaded file; the server then clips it exactly
     // like an uploaded video. If the browser cannot fetch it, fall
     // back to the server-side link fetch. Skipped when a time range
-    // is set (the server fetches only the segment instead).
-    if (link && !file && ytVideoId(link) && !hasRange) {
+    // or Entire Stream is set (the server fetches only the segment
+    // / part instead).
+    if (link && !file && ytVideoId(link) && !hasRange && !entireStream) {
       $("progress-card").classList.remove("hidden");
       $("progress-title").textContent = "Fetching the YouTube video…";
       $("progress-bar").style.width = "5%";
@@ -152,6 +166,7 @@ $("start-btn").addEventListener("click", async () => {
       if (startVal) fd.append("start", startVal);
       if (minutesVal) fd.append("minutes", minutesVal);
     }
+    if (entireStream) fd.append("entire", "1");
     const { id } = await api("/api/jobs", { method: "POST", body: fd });
     currentJob = id;
     $("progress-card").classList.remove("hidden");
@@ -196,6 +211,10 @@ function clipCard(c, i, jid) {
   const first = c.files[0];
   const div = document.createElement("div");
   div.className = "clip";
+  // Entire-stream clips carry their part number + absolute time in
+  // the video (e.g. Part 3 · 1:05:00) so the user can find the moment.
+  const partBadge = c.part ? `<span class="badge">Part ${c.part}</span>` : "";
+  const atBadge = (c.abs_start != null) ? `<span class="badge">@ ${fmtHMS(c.abs_start)}</span>` : "";
   div.innerHTML = `
     <h3>Clip ${i + 1}: ${esc(c.title || c.type || "Moment")}</h3>
     <p class="hook">${esc(c.hook || "")}</p>
@@ -203,6 +222,7 @@ function clipCard(c, i, jid) {
       <span class="badge">⭐ ${c.score || "?"} / 100</span>
       <span class="badge">⏱ ${c.seconds || "?"} sec</span>
       <span class="badge">${esc(c.type || "")}</span>
+      ${partBadge}${atBadge}
     </div>
     ${first ? `<video controls preload="metadata" playsinline src="${first.url}"></video>` : ""}
     <div class="actions">
