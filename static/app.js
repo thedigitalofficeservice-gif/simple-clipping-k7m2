@@ -298,7 +298,7 @@ $("start-btn").addEventListener("click", async () => {
   const minutesVal = ($("minutes") ? $("minutes").value : "").trim();
   const hasRange = startVal !== "" || (minutesVal !== "" && +minutesVal !== 30);
   // Entire-stream mode: the server splits the whole video into
-  // 30-min parts and clips each part in turn. Skip the browser-side
+  // 5-min parts and clips each part in turn. Skip the browser-side
   // fetch (it would download the whole video) — the server fetches
   // only one part at a time.
   const entireStream = $("entire") ? $("entire").checked : false;
