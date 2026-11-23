@@ -86,6 +86,21 @@ RECIPE = {"clips": 6, "length": "short", "style": "auto",
 # cannot process multi-hour livestreams whole — it runs out of memory).
 MAX_CLIP_MINUTES = 30
 
+# Entire-stream mode: a long video is split into 30-minute parts and
+# each part is clipped by the engine in turn (one at a time, same 1 GB
+# limit). Completed parts + their clips are saved after every part, so
+# a server restart resumes from the next unfinished part.
+SEGMENT_SECONDS = 1800
+
+
+class EngineError(Exception):
+    """The clipping engine failed on one source (phase 1 or 2)."""
+
+
+def _fmt_hms(sec):
+    sec = max(0, int(sec))
+    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+
 
 def _parse_time(s):
     """Parse a start time into seconds. Accepts HH:MM:SS, MM:SS or plain
@@ -153,6 +168,21 @@ def _load_manifests():
         try:
             data = json.loads(mf.read_text(encoding="utf-8"))
             if data.get("status") in ("queued", "running"):
+                # Entire-stream jobs RESUME instead of failing: their
+                # manifest already holds the finished parts + clips, so
+                # re-queue them and _run_stream_job skips the done parts.
+                # (Only when progress was actually saved; otherwise the
+                # normal "restarted while running" failure applies.)
+                stream = data.get("params", {}).get("stream") or {}
+                segs = stream.get("segments") or []
+                if data.get("params", {}).get("entire_stream") and any(
+                        s.get("status") == "done" for s in segs):
+                    data["status"] = "queued"
+                    data["stage"] = "Queued — resuming from the next part"
+                    data.setdefault("log", [])
+                    jobs[data["id"]] = data
+                    queue.append(data["id"])
+                    continue
                 data["status"] = "failed"
                 data["stage"] = "Failed"
                 data["error"] = "The server restarted while this job was running."
@@ -282,6 +312,74 @@ def _find_output(start_ts, topic):
     return best
 
 
+def _run_engine(job, source, start_ts, env, p, prefix=""):
+    """Run the engine (phase 1 + phase 2) on one source URL and collect
+    its clips. `prefix` namespaces the clip filenames (entire-stream
+    parts would otherwise collide on "01_...mp4"). Returns
+    (clips, posting, outdir) on success, None if the user cancelled,
+    and raises EngineError if a phase fails. Each clip dict carries
+    "start" (seconds into this source) so the caller can offset it to
+    the full video's timeline. The engine only returns clips for
+    moments that qualify — it never forces the --total count.
+    """
+    jid = job["id"]
+    job_dir = JOBS_DIR / jid
+    clip_args = ["clip", source,
+                 "--total", str(p["clips"]),
+                 "--styles", p["style"],
+                 "--length", p["length"],
+                 "--brain", "none",
+                 "--topic", p["topic"]]
+    _note(job, "Running the clipping engine (phase 1: finding moments)...")
+    code1 = _run_cmd(job, [sys.executable, str(BASE / "phase1.py"), *clip_args],
+                     env, ENGINE_DIR, cap=60)
+    if code1 is None:  # cancelled
+        return None
+    if code1 != 0:
+        tail = "\n".join(job["log"][-12:])
+        raise EngineError("Phase 1 (finding moments) stopped without finished clips "
+                          f"(exit {code1}). Last output:\n{tail}")
+    outdir = _find_output(start_ts, p["topic"])
+    if outdir is None:
+        tail = "\n".join(job["log"][-12:])
+        raise EngineError("Phase 1 finished but no clip folder was found. "
+                          f"Last output:\n{tail}")
+    _note(job, "Moments picked — rendering clips (phase 2)...")
+    code2 = _run_cmd(job, [sys.executable,
+                           str(ENGINE_DIR / "scripts" / "beyondgtaclips.py"),
+                           "remake", str(outdir)],
+                     env, ENGINE_DIR)
+    if code2 is None:  # cancelled
+        return None
+    if code2 != 0:
+        tail = "\n".join(job["log"][-12:])
+        raise EngineError("Phase 2 (rendering clips) stopped without finished clips "
+                          f"(exit {code2}). Last output:\n{tail}")
+    data = json.loads((outdir / "clips.json").read_text(encoding="utf-8"))
+    clips = []
+    for c in data.get("clips", []):
+        files = []
+        for f in c.get("files", []):
+            src = outdir / f["file"]
+            if src.exists():
+                # Namespace per part so two parts never overwrite each
+                # other's "01_...mp4" in the job folder.
+                fname = prefix + f["file"]
+                dst = job_dir / fname
+                shutil.copy2(src, dst)
+                files.append({"file": fname, "template": f["template"],
+                              "url": f"/api/jobs/{jid}/file/{fname}",
+                              "bytes": src.stat().st_size})
+        clips.append({"title": c.get("title"), "hook": c.get("hook"),
+                      "score": c.get("score"), "seconds": c.get("seconds"),
+                      "start": c.get("start"), "type": c.get("type"),
+                      "style": c.get("style"), "caption": c.get("caption"),
+                      "hashtags": c.get("hashtags"), "files": files})
+    posting = (outdir / "POSTING.md").read_text(encoding="utf-8", errors="replace") \
+        if (outdir / "POSTING.md").exists() else ""
+    return clips, posting, outdir
+
+
 def _run_job(job):
     jid = job["id"]
     job_dir = JOBS_DIR / jid
@@ -308,6 +406,16 @@ def _run_job(job):
                                              "loudness": None,
                                              "x264_preset": "veryfast",
                                              "punch_ins": False}), encoding="utf-8")
+        env = dict(os.environ, BEYONDGTACLIPS_HOME=str(ENGINE_HOME),
+                   ENGINE_DIR=str(ENGINE_DIR), PYTHONIOENCODING="utf-8")
+        # Entire-stream mode (YouTube URL + checkbox): split the whole
+        # video into 30-minute parts and clip each part in turn. Handled
+        # by _run_stream_job (it saves progress after every part, so a
+        # server restart resumes from the next unfinished part).
+        if p.get("entire_stream") and p.get("source_type") == "url" \
+                and yt_fetch is not None and yt_fetch.is_youtube_url(p.get("url", "")):
+            _run_stream_job(job, env)
+            return
         if p.get("source_type") == "upload":
             # Serve the uploaded file on localhost and hand the engine an
             # http(s) URL, because yt-dlp (the engine's downloader) fetches by URL.
@@ -350,67 +458,16 @@ def _run_job(job):
         # render stubbed out (peak ~611 MB); Phase 2 (the engine's own
         # `remake`) re-renders in a fresh process (peak ~328 MB). Same
         # moments, same templates, same 720p clips — just split in two.
-        env = dict(os.environ, BEYONDGTACLIPS_HOME=str(ENGINE_HOME),
-                   ENGINE_DIR=str(ENGINE_DIR), PYTHONIOENCODING="utf-8")
-        clip_args = ["clip", source,
-                     "--total", str(p["clips"]),
-                     "--styles", p["style"],
-                     "--length", p["length"],
-                     "--brain", "none",
-                     "--topic", p["topic"]]
-        _note(job, "Running the clipping engine (phase 1: finding moments)...")
-        code1 = _run_cmd(job, [sys.executable, str(BASE / "phase1.py"), *clip_args],
-                         env, ENGINE_DIR, cap=60)
-        if code1 is None:  # cancelled
-            return
-        if code1 != 0:
-            tail = "\n".join(job["log"][-12:])
+        try:
+            result = _run_engine(job, source, start_ts, env, p)
+        except EngineError as exc:
             job["status"] = "failed"
             job["stage"] = "Failed"
-            job["error"] = ("Phase 1 (finding moments) stopped without finished clips "
-                            f"(exit {code1}). Last output:\n{tail}")
+            job["error"] = str(exc)
             return
-        outdir = _find_output(start_ts, p["topic"])
-        if outdir is None:
-            tail = "\n".join(job["log"][-12:])
-            job["status"] = "failed"
-            job["stage"] = "Failed"
-            job["error"] = ("Phase 1 finished but no clip folder was found. "
-                            f"Last output:\n{tail}")
+        if result is None:  # cancelled
             return
-        _note(job, "Moments picked — rendering clips (phase 2)...")
-        code2 = _run_cmd(job, [sys.executable,
-                               str(ENGINE_DIR / "scripts" / "beyondgtaclips.py"),
-                               "remake", str(outdir)],
-                         env, ENGINE_DIR)
-        if code2 is None:  # cancelled
-            return
-        if code2 != 0:
-            tail = "\n".join(job["log"][-12:])
-            job["status"] = "failed"
-            job["stage"] = "Failed"
-            job["error"] = ("Phase 2 (rendering clips) stopped without finished clips "
-                            f"(exit {code2}). Last output:\n{tail}")
-            return
-        data = json.loads((outdir / "clips.json").read_text(encoding="utf-8"))
-        clips = []
-        for c in data.get("clips", []):
-            files = []
-            for f in c.get("files", []):
-                src = outdir / f["file"]
-                if src.exists():
-                    dst = job_dir / f["file"]
-                    shutil.copy2(src, dst)
-                    files.append({"file": f["file"], "template": f["template"],
-                                  "url": f"/api/jobs/{jid}/file/{f['file']}",
-                                  "bytes": src.stat().st_size})
-            clips.append({"title": c.get("title"), "hook": c.get("hook"),
-                          "score": c.get("score"), "seconds": c.get("seconds"),
-                          "type": c.get("type"), "style": c.get("style"),
-                          "caption": c.get("caption"), "hashtags": c.get("hashtags"),
-                          "files": files})
-        posting = (outdir / "POSTING.md").read_text(encoding="utf-8", errors="replace") \
-            if (outdir / "POSTING.md").exists() else ""
+        clips, posting, _outdir = result
         job["clips"] = clips
         job["posting"] = posting
         job["status"] = "done" if clips else "failed"
@@ -427,6 +484,163 @@ def _run_job(job):
             local_server.shutdown()
         _save_manifest(job)
         current_proc.pop(jid, None)
+
+
+def _run_stream_job(job, env):
+    """Entire-stream mode: split a long YouTube video into 30-minute
+    parts and clip each part in turn, collecting every part's clips
+    into this one job. After every part the manifest is saved (which
+    segments are done + the clips so far), so a server restart resumes
+    from the next unfinished part instead of starting over. A part
+    that fails is logged and skipped — the rest keep going. Temporary
+    files (the part's source video and the engine's output folder) are
+    deleted after each part so the disk never fills up. Clips are
+    de-duplicated by absolute start time (5-second buckets) so a
+    moment straddling a part boundary is not clipped twice.
+    """
+    jid = job["id"]
+    job_dir = JOBS_DIR / jid
+    p = job["params"]
+    url = p["url"]
+    local_server = None
+    try:
+        stream = p.setdefault("stream", {})
+        # 1) Video length (once; stored so a resume skips this step).
+        duration = stream.get("duration")
+        if not duration:
+            _note(job, "Reading the full video length ...")
+            try:
+                duration = yt_fetch.get_duration(
+                    url, lambda line: _note(job, line))
+            except yt_fetch.FetchError as exc:
+                job["status"] = "failed"
+                job["stage"] = "Failed"
+                job["error"] = str(exc)
+                return
+            stream["duration"] = duration
+            _save_manifest(job)
+        # 2) Segment list (once; stored so a resume keeps the same parts).
+        segments = stream.get("segments")
+        if not segments:
+            total = -(-int(duration) // SEGMENT_SECONDS)  # ceil
+            segments = []
+            for i in range(total):
+                start = i * SEGMENT_SECONDS
+                segments.append({"start": start,
+                                 "dur": min(SEGMENT_SECONDS,
+                                            int(duration) - start),
+                                 "status": "pending"})
+            stream["segments"] = segments
+            _save_manifest(job)
+        total = len(segments)
+        _note(job, f"Entire stream: {_fmt_hms(duration)} split into "
+                   f"{total} part(s) of {SEGMENT_SECONDS // 60} min each.")
+        # 3) Clips collected so far (resume keeps them) + dedupe buckets.
+        all_clips = job.get("clips") or []
+        seen = set()
+        for c in all_clips:
+            if c.get("abs_start") is not None:
+                seen.add(int(c["abs_start"] // 5))
+        # Serve the job folder once; every part is fetched to
+        # job_dir/source.mp4 (overwritten per part) and served from here.
+        from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+        from functools import partial
+        handler = partial(SimpleHTTPRequestHandler, directory=str(job_dir))
+        local_server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=local_server.serve_forever, daemon=True).start()
+        port = local_server.server_address[1]
+        source = f"http://127.0.0.1:{port}/source.mp4"
+        # 4) One part at a time; skip the ones already done.
+        for idx, seg in enumerate(segments):
+            if job.get("cancel_requested"):
+                return
+            if seg.get("status") == "done":
+                continue
+            seg_start = seg["start"]
+            seg_dur = seg["dur"]
+            label = f"Part {idx + 1}/{total}"
+            job["stage"] = f"{label} — {_fmt_hms(seg_start)}"
+            job["progress"] = int(95 * idx / total)
+            _note(job, f"{label}: {_fmt_hms(seg_start)}–"
+                       f"{_fmt_hms(seg_start + seg_dur)} ...")
+            seg_ts = time.time()
+            # Fetch just this part (30 min, not the whole stream).
+            try:
+                yt_fetch.fetch_youtube(
+                    url, job_dir, lambda line: _note(job, line),
+                    seg_start, seg_dur)
+            except yt_fetch.FetchError as exc:
+                seg["status"] = "failed"
+                _note(job, f"{label} fetch failed ({exc}) — continuing "
+                           "with the next part.")
+                _save_manifest(job)
+                continue
+            # Clip this part with the engine.
+            try:
+                result = _run_engine(job, source, seg_ts, env, p,
+                                     prefix=f"p{idx + 1:02d}_")
+            except EngineError as exc:
+                seg["status"] = "failed"
+                _note(job, f"{label} failed ({exc}) — continuing with "
+                           "the next part.")
+                _save_manifest(job)
+                _cleanup_segment(job_dir)
+                continue
+            if result is None:  # cancelled
+                return
+            seg_clips, posting, outdir = result
+            # Offset each clip to the full video's timeline and dedupe.
+            kept = 0
+            for c in seg_clips:
+                rel = c.get("start") or 0
+                abs_start = seg_start + rel
+                bucket = int(abs_start // 5)
+                if bucket in seen:
+                    continue
+                seen.add(bucket)
+                c["abs_start"] = abs_start
+                c["part"] = idx + 1
+                all_clips.append(c)
+                kept += 1
+            job["clips"] = all_clips
+            if posting and not job.get("posting"):
+                job["posting"] = posting
+            seg["status"] = "done"
+            job["progress"] = int(95 * (idx + 1) / total)
+            _note(job, f"{label} done — {kept} clip(s) "
+                       f"({len(all_clips)} total so far).")
+            _save_manifest(job)
+            # 5) Clean up this part's temp files before the next part.
+            _cleanup_segment(job_dir, outdir)
+        job["status"] = "done" if all_clips else "failed"
+        job["stage"] = "Done" if all_clips else "Failed"
+        job["progress"] = 100 if all_clips else job["progress"]
+        if not all_clips:
+            job["error"] = ("No part of the stream produced clips — "
+                            "check the log for each part's result.")
+    except Exception as exc:  # noqa: BLE001 - surface as a failed job, never crash the server
+        job["status"] = "failed"
+        job["stage"] = "Failed"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if local_server:
+            local_server.shutdown()
+        _save_manifest(job)
+        current_proc.pop(jid, None)
+
+
+def _cleanup_segment(job_dir, outdir=None):
+    """Delete one part's temporary files (its source video and the
+    engine's output folder). The finished clips already copied into
+    the job folder are NOT touched."""
+    try:
+        src = Path(job_dir) / "source.mp4"
+        if src.exists():
+            src.unlink()
+    except Exception:
+        pass
+    if outdir:
+        shutil.rmtree(outdir, ignore_errors=True)
 
 
 def _worker():
@@ -454,11 +668,17 @@ def healthz():
 
 @app.post("/api/jobs")
 async def create_job(link: str = Form(""), upload: UploadFile = File(None),
-                     start: str = Form(""), minutes: str = Form("")):
+                     start: str = Form(""), minutes: str = Form(""),
+                     entire: str = Form("")):
     jid = uuid.uuid4().hex[:12]
     job_dir = JOBS_DIR / jid
     job_dir.mkdir(parents=True, exist_ok=True)
     params = dict(RECIPE)
+    # "Process Entire Stream" (YouTube URL only): split the whole video
+    # into 30-minute parts and clip each part in turn, collecting all
+    # clips into this one job. Progress is saved after every part.
+    if (entire or "").strip().lower() in ("1", "on", "true", "yes"):
+        params["entire_stream"] = True
     # Optional time range (for long videos/livestreams): only this
     # segment is fetched and clipped. `start` is HH:MM:SS, MM:SS or
     # seconds; `minutes` is how many minutes to clip (1-30, default 30).

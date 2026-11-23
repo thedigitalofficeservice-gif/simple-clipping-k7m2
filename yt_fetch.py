@@ -354,13 +354,28 @@ def _ytdlp(url, dest, note, client, retries=True, cookies=None, section=None):
         raise FetchError(f"{label} failed: {err}")
 
 
-def _worker_relay(vid, dest, note, start_sec=0, clip_sec=None):
-    """Ask the Cloudflare Worker for stream URLs, download from googlevideo.com.
+def _parse_dur(s):
+    """Parse a duration string (HH:MM:SS, MM:SS or seconds) into seconds."""
+    s = (s or "").strip()
+    if not s:
+        return 0
+    try:
+        parts = s.split(":")
+        if len(parts) == 1:
+            return max(0, int(float(parts[0])))
+        if len(parts) == 2:
+            return max(0, int(parts[0]) * 60 + int(float(parts[1])))
+        if len(parts) == 3:
+            return max(0, int(parts[0]) * 3600 + int(parts[1]) * 60
+                       + int(float(parts[2])))
+    except (ValueError, IndexError):
+        return 0
+    return 0
 
-    Returns the video title. Raises FetchError if the Worker is walled
-    or the download fails. Prefers a single-file (progressive) mp4 at
-    720p or below so the engine gets a ready-to-clip mp4.
-    """
+
+def _relay_fetch(vid, note):
+    """POST the video id to the Cloudflare Worker and return the
+    parsed player JSON. Raises FetchError on failure."""
     worker_url = os.environ.get("YT_RELAY_URL", "").strip()
     secret = os.environ.get("YT_RELAY_SECRET", "").strip()
     if not worker_url:
@@ -383,6 +398,62 @@ def _worker_relay(vid, dest, note, start_sec=0, clip_sec=None):
     if not data.get("ok"):
         raise FetchError(f"relay: {data.get('error')} "
                          f"{data.get('reason', '')}".strip())
+    return data
+
+
+def get_duration(url, note):
+    """Return a YouTube video's length in seconds.
+
+    Tries the Cloudflare relay's player response (lengthSeconds) first,
+    then yt-dlp --get-duration. Raises FetchError if neither works.
+    """
+    vid = video_id(url)
+    # 1) Relay player response carries videoDetails.lengthSeconds.
+    if os.environ.get("YT_RELAY_URL"):
+        try:
+            data = _relay_fetch(vid, note)
+            secs = data.get("videoDetails", {}).get("lengthSeconds")
+            if secs:
+                secs = int(secs)
+                if secs > 0:
+                    note(f"video length: {_fmt_hms(secs)}")
+                    return secs
+        except (FetchError, ValueError, TypeError) as e:
+            note(f"relay duration failed: {e}")
+    # 2) yt-dlp --get-duration (authenticated session bypasses the wall).
+    packages = Path.home() / ".beyondgtaclips" / "packages"
+    env = dict(os.environ)
+    if packages.exists():
+        env["PYTHONPATH"] = str(packages) + os.pathsep + env.get("PYTHONPATH", "")
+    args = [sys.executable, "-m", "yt_dlp", "--no-check-certificates",
+            "--no-playlist", "--no-warnings", "--get-duration",
+            "--extractor-args", "youtube:player_client=visionos"]
+    cookies = _cookies_file()
+    if cookies:
+        args += ["--cookies", str(cookies)]
+    args.append(url)
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True,
+                              timeout=120, env=env)
+    except Exception as e:  # noqa: BLE001 - report as a fetch failure
+        raise FetchError(f"duration check failed: {type(e).__name__}: {e}")
+    out = (proc.stdout or "").strip().splitlines()
+    for line in out:
+        secs = _parse_dur(line)
+        if secs > 0:
+            note(f"video length: {_fmt_hms(secs)}")
+            return secs
+    raise FetchError("could not read the video length")
+
+
+def _worker_relay(vid, dest, note, start_sec=0, clip_sec=None):
+    """Ask the Cloudflare Worker for stream URLs, download from googlevideo.com.
+
+    Returns the video title. Raises FetchError if the Worker is walled
+    or the download fails. Prefers a single-file (progressive) mp4 at
+    720p or below so the engine gets a ready-to-clip mp4.
+    """
+    data = _relay_fetch(vid, note)
     # Prefer a single-file mp4 at 720p or below (progressive formats).
     cands = [f for f in (data.get("formats") or [])
              if f.get("url") and "mp4" in (f.get("mimeType") or "")]
