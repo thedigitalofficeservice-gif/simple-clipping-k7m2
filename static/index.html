@@ -11,43 +11,106 @@
 <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-<header>
-  <div class="logo">✂️ Simple Clipping</div>
+<header class="topbar">
+  <div class="brand">✂️ Simple Clipping</div>
+  <nav class="tabs" aria-label="Sections">
+    <button class="tab active" data-view="home">Home</button>
+    <button class="tab" data-view="dashboard">Dashboard</button>
+    <button class="tab" data-view="library">Library</button>
+    <button class="tab" data-view="history">History</button>
+  </nav>
 </header>
 
 <main>
-  <section class="card" id="form-card">
-    <h1>Make clips</h1>
-    <p class="sub">Paste a video link, or upload a video file. The app finds the best moments and cuts up to 6 vertical clips with captions.</p>
-    <input id="link" type="url" placeholder="https://www.youtube.com/watch?v=... or Twitch / Kick link" autocomplete="off">
-    <p class="hint">Long video or livestream? Clip one part of it:</p>
-    <div class="row">
-      <input id="start" type="text" placeholder="Start at — e.g. 1:00:00 (empty = from the start)" autocomplete="off">
-      <input id="minutes" type="number" min="1" max="30" value="30" aria-label="Minutes to clip">
+  <!-- ============ HOME ============ -->
+  <section class="view" id="view-home">
+    <section class="card" id="form-card">
+      <h1>Make clips</h1>
+      <p class="sub">Paste a video link, or upload a video file. The app finds the best moments and cuts up to 6 vertical clips with captions.</p>
+      <input id="link" type="url" placeholder="https://www.youtube.com/watch?v=... or Twitch / Kick link" autocomplete="off">
+      <p class="hint">Long video or livestream? Clip one part of it:</p>
+      <div class="row">
+        <input id="start" type="text" placeholder="Start at — e.g. 1:00:00 (empty = from the start)" autocomplete="off">
+        <input id="minutes" type="number" min="1" max="30" value="30" aria-label="Minutes to clip">
+      </div>
+      <p class="hint">Minutes to clip (max 30 per job). Leave the start empty to begin from the start. Short videos need nothing here.</p>
+      <label class="check"><input id="entire" type="checkbox"> ☑ Process Entire Stream — split a long video/livestream into 30-min parts and clip them all into one result.</label>
+      <p class="hint">Or upload a video file instead (up to 500 MB, at least 1 minute long).</p>
+      <input id="file" type="file" accept="video/*,.mkv,.mov,.avi">
+      <p class="hint">Note: a YouTube link is downloaded in your browser first (your home connection is not blocked by YouTube), then uploaded here for clipping — so paste any YouTube video or livestream link. For the most reliable YouTube links, install the free <a href="/simple-clipping-extension.zip" download>Simple Clipping Helper extension</a> in Chrome (one-time setup). Uploading a video file directly always works too. A longer video gives better clips. It takes a few minutes.</p>
+      <button id="start-btn" class="btn primary big">▶ Start Clipping</button>
+      <p id="form-error" class="error hidden"></p>
+    </section>
+
+    <section class="card hidden" id="progress-card">
+      <h2 id="progress-title">Clipping…</h2>
+      <div class="progress"><div id="progress-bar"></div></div>
+      <p id="progress-stage" class="stage">Starting…</p>
+      <pre id="progress-log"></pre>
+      <button id="cancel-btn" class="btn danger">Cancel</button>
+    </section>
+
+    <section id="results"></section>
+
+    <section class="card" id="recent-card">
+      <div class="card-head">
+        <h2>Recent clips</h2>
+        <button class="btn ghost" data-goto="library">Open Library →</button>
+      </div>
+      <p class="sub">Finished clips stay here for 7 days. Watch them again or download them to your phone.</p>
+      <div id="history"><p class="hint">Loading…</p></div>
+    </section>
+  </section>
+
+  <!-- ============ DASHBOARD ============ -->
+  <section class="view hidden" id="view-dashboard">
+    <h1 class="page-title">Dashboard</h1>
+    <p class="sub">Everything your clipper has done, live from the server.</p>
+    <div class="stats" id="stats">
+      <div class="stat"><div class="stat-num" id="stat-clips">—</div><div class="stat-label">Total clips</div></div>
+      <div class="stat"><div class="stat-num" id="stat-projects">—</div><div class="stat-label">Projects / streams</div></div>
+      <div class="stat"><div class="stat-num" id="stat-processing">—</div><div class="stat-label">Processing now</div></div>
+      <div class="stat"><div class="stat-num" id="stat-done">—</div><div class="stat-label">Completed</div></div>
+      <div class="stat"><div class="stat-num" id="stat-failed">—</div><div class="stat-label">Failed</div></div>
     </div>
-    <p class="hint">Minutes to clip (max 30 per job). Leave the start empty to begin from the start. Short videos need nothing here.</p>
-    <label class="check"><input id="entire" type="checkbox"> ☑ Process Entire Stream — split a long video/livestream into 30-min parts and clip them all into one result.</label>
-    <p class="hint">Or upload a video file instead (up to 500 MB, at least 1 minute long).</p>
-    <input id="file" type="file" accept="video/*,.mkv,.mov,.avi">
-    <p class="hint">Note: a YouTube link is downloaded in your browser first (your home connection is not blocked by YouTube), then uploaded here for clipping — so paste any YouTube video or livestream link. For the most reliable YouTube links, install the free <a href="/simple-clipping-extension.zip" download>Simple Clipping Helper extension</a> in Chrome (one-time setup). Uploading a video file directly always works too. A longer video gives better clips. It takes a few minutes.</p>
-    <button id="start-btn" class="btn primary big">▶ Start Clipping</button>
-    <p id="form-error" class="error hidden"></p>
+    <div class="dash-grid">
+      <section class="card">
+        <div class="card-head"><h2>Recent activity</h2><button class="btn ghost" data-goto="history">All history →</button></div>
+        <div id="dash-activity"><p class="hint">Loading…</p></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Recently processed</h2><button class="btn ghost" data-goto="library">Library →</button></div>
+        <div id="dash-recent"><p class="hint">Loading…</p></div>
+      </section>
+    </div>
+    <div class="quick-actions">
+      <button class="btn primary" data-goto="home">▶ Start Clipping</button>
+      <button class="btn" data-goto="library">📚 Open Library</button>
+    </div>
   </section>
 
-  <section class="card hidden" id="progress-card">
-    <h2 id="progress-title">Clipping…</h2>
-    <div class="progress"><div id="progress-bar"></div></div>
-    <p id="progress-stage" class="stage">Starting…</p>
-    <pre id="progress-log"></pre>
-    <button id="cancel-btn" class="btn danger">Cancel</button>
+  <!-- ============ LIBRARY ============ -->
+  <section class="view hidden" id="view-library">
+    <h1 class="page-title">Library</h1>
+    <p class="sub">Every project and its clips. Tap a project to watch and download its clips.</p>
+    <div class="lib-tools">
+      <input id="lib-search" type="search" placeholder="Search by title or link…" autocomplete="off">
+      <select id="lib-filter" aria-label="Filter projects">
+        <option value="all">All projects</option>
+        <option value="done">Completed</option>
+        <option value="processing">Processing</option>
+        <option value="failed">Failed</option>
+      </select>
+    </div>
+    <div id="lib-detail" class="hidden"></div>
+    <div id="lib-grid" class="lib-grid"><p class="hint">Loading…</p></div>
   </section>
 
-  <section id="results"></section>
-
-  <section class="card" id="history-card">
-    <h2>Your clips</h2>
-    <p class="sub">Finished clips stay here for 7 days. Watch them again or download them to your phone.</p>
-    <div id="history"><p class="hint">Loading…</p></div>
+  <!-- ============ HISTORY ============ -->
+  <section class="view hidden" id="view-history">
+    <h1 class="page-title">History</h1>
+    <p class="sub">Every stream and job you have submitted, newest first.</p>
+    <div id="history-list"><p class="hint">Loading…</p></div>
   </section>
 </main>
 
