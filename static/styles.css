@@ -15,6 +15,9 @@ h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:18px; margin:0 0 10px; }
 input { width:100%; background:#0e1319; border:1px solid var(--line); color:var(--text);
   border-radius:10px; padding:12px; font-size:16px; margin:6px 0 12px; }
 input:focus { outline:2px solid var(--accent); border-color:transparent; }
+.row { display:flex; gap:10px; }
+.row input:first-child { flex:1 1 auto; min-width:0; }
+.row input:last-child { flex:0 0 110px; }
 .hint { color:var(--muted); font-size:13px; margin:0 0 12px; }
 .btn { border:0; border-radius:10px; padding:12px 18px; font-size:16px; font-weight:700; cursor:pointer; background:#232c38; color:var(--text); text-decoration:none; display:inline-block; }
 .btn.primary { background:var(--accent); color:#fff; width:100%; }

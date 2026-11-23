@@ -96,14 +96,22 @@ $("start-btn").addEventListener("click", async () => {
   const link = $("link").value.trim();
   let file = $("file").files[0];
   if (!link && !file) { errEl.textContent = "Paste a video link or choose a video file first."; errEl.classList.remove("hidden"); return; }
+  // Long video / livestream time range: only this segment is fetched
+  // and clipped (max 30 min per job). When a range is set, skip the
+  // browser-side fetch (it would download the whole video) and let
+  // the server fetch just the segment.
+  const startVal = ($("start") ? $("start").value : "").trim();
+  const minutesVal = ($("minutes") ? $("minutes").value : "").trim();
+  const hasRange = startVal !== "" || (minutesVal !== "" && +minutesVal !== 30);
   $("start-btn").disabled = true;
   try {
     // YouTube links: fetch the video in THIS browser first (the
     // visitor's home IP is not blocked by YouTube). If that works,
     // upload the downloaded file; the server then clips it exactly
     // like an uploaded video. If the browser cannot fetch it, fall
-    // back to the server-side link fetch.
-    if (link && !file && ytVideoId(link)) {
+    // back to the server-side link fetch. Skipped when a time range
+    // is set (the server fetches only the segment instead).
+    if (link && !file && ytVideoId(link) && !hasRange) {
       $("progress-card").classList.remove("hidden");
       $("progress-title").textContent = "Fetching the YouTube video…";
       $("progress-bar").style.width = "5%";
@@ -140,6 +148,10 @@ $("start-btn").addEventListener("click", async () => {
     const fd = new FormData();
     if (file) fd.append("upload", file);
     else if (link) fd.append("link", link);
+    if (hasRange) {
+      if (startVal) fd.append("start", startVal);
+      if (minutesVal) fd.append("minutes", minutesVal);
+    }
     const { id } = await api("/api/jobs", { method: "POST", body: fd });
     currentJob = id;
     $("progress-card").classList.remove("hidden");
