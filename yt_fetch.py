@@ -285,6 +285,45 @@ def _invidious(vid, dest, note):
     raise FetchError("Invidious: all instances failed")
 
 
+def _ytdlp_segment(url, dest, note, start_sec, clip_sec, client, cookies=None):
+    """Fetch ONE time segment via yt-dlp + ffmpeg (NOT --download-sections).
+
+    yt-dlp --download-sections downloads the whole file first for many
+    formats, which is far too slow for a multi-hour video. Instead we
+    ask yt-dlp for the progressive (single-file) stream URL and let
+    ffmpeg seek-extract just the segment with HTTP Range requests, so
+    only the needed minutes are downloaded. Raises FetchError if the
+    URL cannot be obtained or the segment extraction fails.
+    """
+    packages = Path.home() / ".beyondgtaclips" / "packages"
+    env = dict(os.environ)
+    if packages.exists():
+        env["PYTHONPATH"] = str(packages) + os.pathsep + env.get("PYTHONPATH", "")
+    # Best single-file (progressive) mp4 at 720p or below — one URL
+    # carrying both video and audio, so ffmpeg can seek into it.
+    args = [sys.executable, "-m", "yt_dlp", "--no-check-certificates",
+            "--no-playlist", "--no-warnings", "--get-url",
+            "-f", "b[height<=720]/b",
+            "--extractor-args", f"youtube:player_client={client}"]
+    if cookies:
+        args += ["--cookies", str(cookies)]
+    args.append(url)
+    note(f"getting the stream URL ({client}) ...")
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True,
+                              timeout=120, env=env)
+    except Exception as e:  # noqa: BLE001 - report as a fetch failure
+        raise FetchError(f"stream URL failed: {type(e).__name__}: {e}")
+    urls = [ln.strip() for ln in (proc.stdout or "").splitlines()
+            if ln.strip().startswith("http")]
+    if proc.returncode != 0 or not urls:
+        err = (proc.stderr or "").strip().splitlines()[-1:] 
+        raise FetchError("stream URL failed: "
+                         + (" | ".join(err)[:200] if err else "no URL returned"))
+    _download_segment(urls[0], dest, start_sec, clip_sec, note)
+    return ""
+
+
 def _ytdlp(url, dest, note, client, retries=True, cookies=None, section=None):
     """The engine's own yt-dlp, with a chosen player client.
 
@@ -489,12 +528,10 @@ def fetch_youtube(url, dest_dir, note, start_sec=0, clip_sec=None):
     vid = video_id(url)
     title = ""
     errors = []
-    # Time range for long videos: yt-dlp downloads only this section;
-    # the relay extracts the same segment with ffmpeg.
-    section = None
+    # Time range for long videos: only the segment starting at
+    # `start_sec` (for `clip_sec` seconds) is fetched — via ffmpeg
+    # seek-extraction, so the whole multi-hour file is never downloaded.
     if clip_sec:
-        section = (f"*{_fmt_hms(start_sec)}-"
-                   f"{_fmt_hms(start_sec + clip_sec)}")
         note(f"clipping {clip_sec // 60} min from {_fmt_hms(start_sec)}")
     # Authenticated session (separate throwaway account) bypasses the
     # per-IP rate limit. Decoded once per fetch from YTDLP_COOKIES_B64.
@@ -523,8 +560,14 @@ def fetch_youtube(url, dest_dir, note, start_sec=0, clip_sec=None):
         if dest.exists():
             dest.unlink()
         try:
-            title = _ytdlp(url, dest, note, client, retries=False,
-                           cookies=cookies, section=section) or title
+            if clip_sec:
+                # Segment: yt-dlp gives the stream URL, ffmpeg extracts
+                # just this part (fast seek, no full download).
+                title = _ytdlp_segment(url, dest, note, start_sec, clip_sec,
+                                       client, cookies=cookies) or title
+            else:
+                title = _ytdlp(url, dest, note, client, retries=False,
+                               cookies=cookies) or title
             if dest.exists() and dest.stat().st_size >= 100_000:
                 note(f"YouTube video fetched via yt-dlp {client} ({title or 'untitled'})")
                 return dest, title
@@ -539,8 +582,12 @@ def fetch_youtube(url, dest_dir, note, start_sec=0, clip_sec=None):
     if dest.exists():
         dest.unlink()
     try:
-        title = _ytdlp(url, dest, note, "visionos", retries=True,
-                       cookies=cookies, section=section) or title
+        if clip_sec:
+            title = _ytdlp_segment(url, dest, note, start_sec, clip_sec,
+                                   "visionos", cookies=cookies) or title
+        else:
+            title = _ytdlp(url, dest, note, "visionos", retries=True,
+                           cookies=cookies) or title
         if dest.exists() and dest.stat().st_size >= 100_000:
             note(f"YouTube video fetched via yt-dlp visionos (retry) ({title or 'untitled'})")
             return dest, title

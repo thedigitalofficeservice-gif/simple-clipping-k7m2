@@ -218,7 +218,11 @@ def _note(job, line, cap=None):
                 if key == "done:":
                     stage = "Moments picked — rendering clips"
             job["stage"] = stage
-            job["progress"] = max(job["progress"], pct)
+            # Entire-stream jobs track progress by parts completed, not
+            # by the engine's per-part log lines (which would jump to
+            # 96% on part 1); the stream loop sets progress itself.
+            if not job.get("params", {}).get("entire_stream"):
+                job["progress"] = max(job["progress"], pct)
             break
 
 
@@ -530,6 +534,12 @@ def _run_stream_job(job, env):
                                  "dur": min(SEGMENT_SECONDS,
                                             int(duration) - start),
                                  "status": "pending"})
+            # A trailing sliver under ~1 minute cannot be clipped (the
+            # engine refuses sources that short), so fold it into the
+            # previous part instead of making a part that always fails.
+            if len(segments) > 1 and segments[-1]["dur"] < 65:
+                segments[-2]["dur"] += segments[-1]["dur"]
+                segments.pop()
             stream["segments"] = segments
             _save_manifest(job)
         total = len(segments)
