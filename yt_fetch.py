@@ -308,6 +308,52 @@ def _ytdlp(url, dest, note, client, retries=True, cookies=None):
         raise FetchError(f"{label} failed: {err}")
 
 
+def _worker_relay(vid, dest, note):
+    """Ask the Cloudflare Worker for stream URLs, download from googlevideo.com.
+
+    Returns the video title. Raises FetchError if the Worker is walled
+    or the download fails. Prefers a single-file (progressive) mp4 at
+    720p or below so the engine gets a ready-to-clip mp4.
+    """
+    worker_url = os.environ.get("YT_RELAY_URL", "").strip()
+    secret = os.environ.get("YT_RELAY_SECRET", "").strip()
+    if not worker_url:
+        raise FetchError("relay: YT_RELAY_URL not set")
+    note(f"trying Cloudflare relay ({worker_url}) ...")
+    payload = json.dumps({"videoId": vid}).encode("utf-8")
+    headers = {**UA, "Content-Type": "application/json",
+               "Accept": "application/json"}
+    if secret:
+        headers["x-relay-secret"] = secret
+    req = urllib.request.Request(worker_url, data=payload,
+                                 method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        raise FetchError(f"relay: HTTP {e.code}")
+    except Exception as e:
+        raise FetchError(f"relay: {type(e).__name__}: {e}")
+    if not data.get("ok"):
+        raise FetchError(f"relay: {data.get('error')} "
+                         f"{data.get('reason', '')}".strip())
+    # Prefer a single-file mp4 at 720p or below (progressive formats).
+    cands = [f for f in (data.get("formats") or [])
+             if f.get("url") and "mp4" in (f.get("mimeType") or "")]
+    def _h(f):
+        try:
+            return int((f.get("qualityLabel") or "0p").rstrip("p"))
+        except ValueError:
+            return 0
+    cands.sort(key=_h, reverse=True)
+    pick = next((f for f in cands if _h(f) <= 720), cands[0] if cands else None)
+    if pick is None:
+        raise FetchError("relay: no mp4 stream returned")
+    note(f"relay gave a {pick.get('qualityLabel')} stream, fetching ...")
+    _download(pick["url"], dest, note)
+    return data.get("title") or ""
+
+
 def fetch_youtube(url, dest_dir, note):
     """Download a YouTube URL to dest_dir/source.mp4. Returns (path, title).
 
@@ -325,6 +371,18 @@ def fetch_youtube(url, dest_dir, note):
     cookies = _cookies_file()
     if cookies:
         note("using saved YouTube login (separate account) for the fetch")
+    # Cloudflare Worker relay first (if configured): its edge IPs may
+    # still have player-API quota while this server's IP is exhausted.
+    # Falls back to the yt-dlp loop below if the relay fails.
+    if os.environ.get("YT_RELAY_URL"):
+        try:
+            title = _worker_relay(vid, dest, note)
+            if dest.exists() and dest.stat().st_size >= 100_000:
+                note(f"YouTube video fetched via Cloudflare relay ({title or 'untitled'})")
+                return dest, title
+        except FetchError as e:
+            errors.append(f"relay: {e}")
+            note(f"relay failed: {e}")
     # Pass 1: every player client once, no waits. A failed attempt
     # answers in seconds, so this whole pass takes ~1-2 min and
     # succeeds as soon as ANY client still has quota. cobalt /
