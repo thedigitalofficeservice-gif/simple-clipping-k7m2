@@ -156,6 +156,47 @@ def _http_json(method, url, payload=None, timeout=30):
         raise FetchError(f"{url} -> {type(e).__name__}: {e}")
 
 
+def _fmt_hms(sec):
+    """Format seconds as HH:MM:SS (for yt-dlp --download-sections)."""
+    sec = max(0, int(sec))
+    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+
+
+def _download_segment(url, dest, start_sec, duration_sec, note):
+    """Extract one time segment from a stream URL with ffmpeg.
+
+    Uses -ss before -i so ffmpeg seeks (HTTP Range) instead of
+    downloading the whole file — essential for multi-hour livestreams.
+    -c copy keeps it fast; the output may start at the previous
+    keyframe (a few seconds early), which is fine for clipping.
+    Raises FetchError on failure so the caller falls back to yt-dlp.
+    """
+    import subprocess
+    tmp = dest.with_suffix(".seg.mp4")
+    if tmp.exists():
+        tmp.unlink()
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-ss", str(int(start_sec)), "-i", url,
+           "-t", str(int(duration_sec)), "-c", "copy",
+           "-movflags", "+faststart", "-y", str(tmp)]
+    note(f"fetching {duration_sec // 60} min segment from "
+         f"{_fmt_hms(start_sec)} ...")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except Exception as e:  # noqa: BLE001 - report as a fetch failure
+        raise FetchError(f"segment extract failed: {type(e).__name__}: {e}")
+    if proc.returncode != 0 or not tmp.exists() \
+            or tmp.stat().st_size < 100_000:
+        if tmp.exists():
+            tmp.unlink()
+        err = (proc.stderr or "").strip().splitlines()[-1:] 
+        raise FetchError("segment extract failed: "
+                         + (" | ".join(err)[:200] if err else "ffmpeg error"))
+    tmp.replace(dest)
+    note(f"segment downloaded {dest.stat().st_size / 1024 / 1024:.1f} MB")
+    return dest.stat().st_size
+
+
 def _download(url, dest, note):
     """Stream a URL to dest, aborting over MAX_BYTES. Returns bytes written."""
     req = urllib.request.Request(url, headers=UA)
@@ -244,7 +285,7 @@ def _invidious(vid, dest, note):
     raise FetchError("Invidious: all instances failed")
 
 
-def _ytdlp(url, dest, note, client, retries=True, cookies=None):
+def _ytdlp(url, dest, note, client, retries=True, cookies=None, section=None):
     """The engine's own yt-dlp, with a chosen player client.
 
     Retries with backoff when YouTube answers with the bot wall
@@ -253,6 +294,8 @@ def _ytdlp(url, dest, note, client, retries=True, cookies=None):
     A retry right away would just spend quota again, so we wait.
     When `cookies` (a Netscape cookies.txt path) is given, it is
     passed via --cookies: an authenticated session bypasses the wall.
+    When `section` is set (e.g. "*00:00:00-00:30:00"), only that time
+    range is downloaded — for multi-hour livestreams.
     """
     packages = Path.home() / ".beyondgtaclips" / "packages"
     env = dict(os.environ)
@@ -268,6 +311,9 @@ def _ytdlp(url, dest, note, client, retries=True, cookies=None):
             "-o", str(dest), url]
     if client:
         args[4:4] = ["--extractor-args", f"youtube:player_client={client}"]
+    if section:
+        # Insert --download-sections just before the URL (last element).
+        args[-1:-1] = ["--download-sections", section]
     if cookies:
         # Insert --cookies just before the URL (last element).
         args[-1:-1] = ["--cookies", str(cookies)]
@@ -308,7 +354,7 @@ def _ytdlp(url, dest, note, client, retries=True, cookies=None):
         raise FetchError(f"{label} failed: {err}")
 
 
-def _worker_relay(vid, dest, note):
+def _worker_relay(vid, dest, note, start_sec=0, clip_sec=None):
     """Ask the Cloudflare Worker for stream URLs, download from googlevideo.com.
 
     Returns the video title. Raises FetchError if the Worker is walled
@@ -350,15 +396,21 @@ def _worker_relay(vid, dest, note):
     if pick is None:
         raise FetchError("relay: no mp4 stream returned")
     note(f"relay gave a {pick.get('qualityLabel')} stream, fetching ...")
-    _download(pick["url"], dest, note)
+    if clip_sec:
+        _download_segment(pick["url"], dest, start_sec, clip_sec, note)
+    else:
+        _download(pick["url"], dest, note)
     return data.get("title") or ""
 
 
-def fetch_youtube(url, dest_dir, note):
+def fetch_youtube(url, dest_dir, note, start_sec=0, clip_sec=None):
     """Download a YouTube URL to dest_dir/source.mp4. Returns (path, title).
 
     Raises FetchError with a human-readable reason if every method fails.
     `note` is a callable taking one string (appended to the job log).
+    When `clip_sec` is set, only the segment starting at `start_sec`
+    (for `clip_sec` seconds) is fetched — for multi-hour livestreams
+    that the free server cannot process whole.
     """
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -366,6 +418,13 @@ def fetch_youtube(url, dest_dir, note):
     vid = video_id(url)
     title = ""
     errors = []
+    # Time range for long videos: yt-dlp downloads only this section;
+    # the relay extracts the same segment with ffmpeg.
+    section = None
+    if clip_sec:
+        section = (f"*{_fmt_hms(start_sec)}-"
+                   f"{_fmt_hms(start_sec + clip_sec)}")
+        note(f"clipping {clip_sec // 60} min from {_fmt_hms(start_sec)}")
     # Authenticated session (separate throwaway account) bypasses the
     # per-IP rate limit. Decoded once per fetch from YTDLP_COOKIES_B64.
     cookies = _cookies_file()
@@ -376,7 +435,7 @@ def fetch_youtube(url, dest_dir, note):
     # Falls back to the yt-dlp loop below if the relay fails.
     if os.environ.get("YT_RELAY_URL"):
         try:
-            title = _worker_relay(vid, dest, note)
+            title = _worker_relay(vid, dest, note, start_sec, clip_sec)
             if dest.exists() and dest.stat().st_size >= 100_000:
                 note(f"YouTube video fetched via Cloudflare relay ({title or 'untitled'})")
                 return dest, title
@@ -394,7 +453,7 @@ def fetch_youtube(url, dest_dir, note):
             dest.unlink()
         try:
             title = _ytdlp(url, dest, note, client, retries=False,
-                           cookies=cookies) or title
+                           cookies=cookies, section=section) or title
             if dest.exists() and dest.stat().st_size >= 100_000:
                 note(f"YouTube video fetched via yt-dlp {client} ({title or 'untitled'})")
                 return dest, title
@@ -410,7 +469,7 @@ def fetch_youtube(url, dest_dir, note):
         dest.unlink()
     try:
         title = _ytdlp(url, dest, note, "visionos", retries=True,
-                       cookies=cookies) or title
+                       cookies=cookies, section=section) or title
         if dest.exists() and dest.stat().st_size >= 100_000:
             note(f"YouTube video fetched via yt-dlp visionos (retry) ({title or 'untitled'})")
             return dest, title

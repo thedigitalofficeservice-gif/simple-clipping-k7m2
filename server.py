@@ -82,6 +82,30 @@ ALLOWED_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg", ".avi"
 RECIPE = {"clips": 6, "length": "short", "style": "auto",
           "captions": "slurs", "topic": "Gaming", "focus": ""}
 
+# Long-video time range: max 30 minutes per job (the free 1 GB server
+# cannot process multi-hour livestreams whole — it runs out of memory).
+MAX_CLIP_MINUTES = 30
+
+
+def _parse_time(s):
+    """Parse a start time into seconds. Accepts HH:MM:SS, MM:SS or plain
+    seconds (e.g. "1:00:00", "90", "1:30"). Returns 0 on empty/invalid."""
+    s = (s or "").strip()
+    if not s:
+        return 0
+    try:
+        parts = s.split(":")
+        if len(parts) == 1:
+            return max(0, int(float(parts[0])))
+        if len(parts) == 2:
+            return max(0, int(parts[0]) * 60 + int(float(parts[1])))
+        if len(parts) == 3:
+            return max(0, int(parts[0]) * 3600 + int(parts[1]) * 60
+                       + int(float(parts[2])))
+    except (ValueError, IndexError):
+        return 0
+    return 0
+
 app = FastAPI(title="Simple Clipping")
 jobs = {}              # id -> job dict
 jobs_lock = threading.Lock()
@@ -304,7 +328,8 @@ def _run_job(job):
                        "downloader service first)...")
             try:
                 _fpath, _title = yt_fetch.fetch_youtube(
-                    p["url"], job_dir, lambda line: _note(job, line))
+                    p["url"], job_dir, lambda line: _note(job, line),
+                    p.get("start_sec", 0), p.get("clip_sec"))
             except yt_fetch.FetchError as exc:
                 job["status"] = "failed"
                 job["stage"] = "Failed"
@@ -428,11 +453,26 @@ def healthz():
 
 
 @app.post("/api/jobs")
-async def create_job(link: str = Form(""), upload: UploadFile = File(None)):
+async def create_job(link: str = Form(""), upload: UploadFile = File(None),
+                     start: str = Form(""), minutes: str = Form("")):
     jid = uuid.uuid4().hex[:12]
     job_dir = JOBS_DIR / jid
     job_dir.mkdir(parents=True, exist_ok=True)
     params = dict(RECIPE)
+    # Optional time range (for long videos/livestreams): only this
+    # segment is fetched and clipped. `start` is HH:MM:SS, MM:SS or
+    # seconds; `minutes` is how many minutes to clip (1-30, default 30).
+    # Only stored when the user set a start time or a non-default
+    # length, so short videos keep the current behaviour.
+    start_sec = _parse_time(start)
+    try:
+        clip_min = int(float((minutes or "").strip())) if (minutes or "").strip() else 30
+    except ValueError:
+        clip_min = 30
+    clip_min = max(1, min(MAX_CLIP_MINUTES, clip_min))
+    ranged = bool((start or "").strip()) or (minutes or "").strip() != ""
+    if ranged:
+        params.update(start_sec=start_sec, clip_sec=clip_min * 60)
     if upload is not None and upload.filename:
         ext = Path(upload.filename).suffix.lower()
         if ext not in ALLOWED_EXTS:
